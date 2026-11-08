@@ -45,7 +45,7 @@ cam.position.copy(camDir).multiplyScalar(4000);
 cam.lookAt(0, 0, 0);
 cam.updateMatrixWorld();
 const SUN = new THREE.Vector3(0.38, 0.62, 0.68).normalize();
-const RELIEF = Number(PARAMS.relief || 3);   // zesílení stínování svahů terénu (1 = původní slabé, 3 = výrazné kopce)
+const RELIEF = Number(PARAMS.relief || 10);   // zesílení stínování svahů terénu (1 = původní slabé, 3 = mírné, 10 = výrazné kopce)
 
 // ---------- společné shadery ----------
 const COMMON = /* glsl */`
@@ -166,7 +166,7 @@ const C255 = (rgb) => rgb.map((v) => v / 255);
       float d = max(dot(n, uSun), 0.0);
       float s = shadow(vW, n);
       // svahy: osvětlení proti rovině (uSun.y = rovina), zesílené RELIEF krát, ve stupních (pixel-art)
-      float rel = clamp((d - uSun.y) * ${RELIEF.toFixed(2)}, -0.38, 0.22);
+      float rel = clamp((d - uSun.y) * ${RELIEF.toFixed(2)}, -0.45, 0.25);
       float l = 0.92 + floor(rel * 16.0 + 0.5) / 16.0;
       col *= l * (s > 0.5 ? 1.0 : 0.74);
       if (s < 0.5) col *= vec3(0.92, 0.96, 1.08);
