@@ -1,0 +1,32 @@
+[
+ {
+  "name": "Kostel na náměstí (ukázka)",
+  "lat": 50.0, "lon": 15.0,
+  "text": "Podle fotek z náměstí a ze strany: věž v průčelí s hodinami a cibulí, sedlová střecha lodi.",
+  "spec": {
+   "wc": [214, 204, 178], "rc": [92, 60, 48], "r": "gabled", "h": 14, "rh": 8,
+   "face": [50.0003, 15.0],
+   "towers": [{"at": "front", "w": 6.5, "h": 30, "top": "helm", "to": 42, "tc": [72, 120, 104], "clock": 1}]
+  }
+ },
+ {
+  "name": "Radnice (ukázka)",
+  "lat": 50.0005, "lon": 15.001,
+  "text": "Tři věže v řadě čelem k náměstí.",
+  "spec": {
+   "wc": [206, 196, 170], "rc": [70, 72, 78], "r": "hipped", "h": 20, "rh": 10, "win": 8,
+   "face": [50.0002, 15.001],
+   "towers": [
+    {"at": "front", "w": 8, "h": 40, "top": "tiered", "to": 60, "tc": [96, 146, 128], "clock": 1},
+    {"at": "front", "side": -11, "w": 5, "h": 26, "top": "tiered", "to": 40, "tc": [96, 146, 128]},
+    {"at": "front", "side": 11, "w": 5, "h": 26, "top": "tiered", "to": 40, "tc": [96, 146, 128]}
+   ]
+  }
+ },
+ {
+  "name": "Zřícenina hradu (ukázka)",
+  "lat": 50.002, "lon": 15.003,
+  "text": "Samostatná stavba bez budovy v datech: dvě věže a kus hradby.",
+  "spec": {"only": 1, "towers": [{"at": "c", "w": 7, "h": 14, "top": "none", "round": 1, "stone": 1, "ruin": 1}]}
+ }
+]

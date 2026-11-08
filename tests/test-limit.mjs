@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const html=fs.readFileSync('web/app.html','utf8');
+const f=html.match(/function limitCars\(all, share, slow\) \{[\s\S]*?\n  \}/)?.[0];assert.ok(f);
+const choose=Function('const SLOW_SHARE=.35,MAX_CARS=1000,MAX_CARS_SLOW=300; '+f+'; return limitCars;')();
+const active=(items,share,slow)=>{const x=choose(items,share,slow);return items.filter(c=>c.q<=x.threshold&&(!x.allowed||x.allowed.has(c))).length};
+const many=Array.from({length:5000},(_,i)=>({q:.01+i/100000})), few=Array.from({length:50},()=>({q:.01})), twins=Array.from({length:5000},()=>({q:.01}));
+assert.equal(active(many,1,false),1000);assert.equal(active(many,1,true),300);assert.equal(active(many,.5,false),500);assert.equal(active(many,.5,true),150);
+assert.equal(active(few,1,false),50);assert.equal(active(twins,1,false),1000);assert.equal(active(twins,1,true),300);assert.equal(active(many,0,false),0);
+console.log('OK: stropy 1000/300, denní podíl, malé množství a shodné hodnoty výběru');

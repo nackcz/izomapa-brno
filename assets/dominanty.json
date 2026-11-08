@@ -1,0 +1,44 @@
+[
+ {
+  "name": "Katedrála sv. Petra a Pavla (Petrov)",
+  "lat": 49.19100, "lon": 16.60746,
+  "text": "Novogotické dvojvěží (cca 84 m) na západním průčelí, strmá tmavá střecha lodi. Obecný odhad, doladit podle fotek.",
+  "spec": {
+   "wc": [196, 186, 166], "rc": [62, 64, 70], "r": "gabled", "h": 20, "rh": 14,
+   "face": [49.19100, 16.60600],
+   "towers": [
+    {"at": "front", "side": -6, "w": 6, "h": 50, "top": "spire", "to": 84, "tc": [70, 72, 78], "stone": 1},
+    {"at": "front", "side": 6, "w": 6, "h": 50, "top": "spire", "to": 84, "tc": [70, 72, 78], "stone": 1}
+   ]
+  }
+ },
+ {
+  "name": "Kostel sv. Jakuba",
+  "lat": 49.19661, "lon": 16.60840,
+  "text": "Gotický halový kostel, západní věž s jehlancovou střechou (cca 92 m). Obecný odhad, doladit podle fotek.",
+  "spec": {
+   "wc": [200, 192, 172], "rc": [74, 70, 70], "r": "gabled", "h": 18, "rh": 14,
+   "face": [49.19661, 16.60700],
+   "towers": [{"at": "front", "w": 8, "h": 55, "top": "spire", "to": 92, "tc": [66, 68, 74], "clock": 1, "stone": 1}]
+  }
+ },
+ {
+  "name": "Stará radnice",
+  "lat": 49.19304, "lon": 16.60826,
+  "text": "Radniční věž (cca 63 m) s ochozem a špičatou střechou nad vstupem z Radnické ulice. Obecný odhad.",
+  "spec": {
+   "wc": [214, 204, 180], "rc": [128, 70, 52], "r": "hipped", "h": 14, "rh": 7,
+   "face": [49.19304, 16.60760],
+   "towers": [{"at": "front", "w": 8, "h": 46, "top": "spire", "to": 63, "tc": [74, 104, 92], "clock": 1}]
+  }
+ },
+ {
+  "name": "Kostel sv. Tomáše",
+  "lat": 49.19795, "lon": 16.60786,
+  "text": "Gotický kostel s barokním průčelím, věž s helmicí. Obecný odhad.",
+  "spec": {
+   "wc": [214, 206, 184], "rc": [96, 72, 60], "r": "gabled", "h": 17, "rh": 12,
+   "towers": [{"at": "w", "w": 7, "h": 40, "top": "helm", "to": 56, "tc": [72, 118, 102], "clock": 1}]
+  }
+ }
+]

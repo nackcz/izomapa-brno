@@ -1,0 +1,20 @@
+{
+  "name": "izomapa",
+  "version": "1.0.0",
+  "description": "Izometrická pixel-art mapa českého města z otevřených dat",
+  "type": "module",
+  "scripts": {
+    "nahled": "python3 -m http.server -d site 8000 || python -m http.server -d site 8000"
+  },
+  "author": "Adam Klatovský",
+  "license": "AGPL-3.0-or-later",
+  "dependencies": {
+    "openseadragon": "^4.1.0",
+    "playwright": "^1.56.1",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.152.0"
+  },
+  "private": true
+}

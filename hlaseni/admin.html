@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hlášení nepřesností – administrace</title>
+<meta name="robots" content="noindex">
+<style>
+  :root { --bg: #1b2333; --panel: #232d42; --ink: #e9e6dc; --muted: #9aa3b5; --edge: #3a4660; --acc: #f2c66d; --bad: #e27a5c; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.3rem; margin: 8px 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 16px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-bottom: 12px; }
+  label { color: var(--muted); }
+  input, select, button { font: inherit; background: var(--panel); color: var(--ink); border: 1px solid var(--edge); padding: 5px 8px; }
+  button { cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--edge); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  td.n { font-weight: 700; color: var(--acc); width: 3em; }
+  tr.hot td.n { color: var(--bad); }
+  .kinds { color: var(--muted); font-size: .9em; }
+  .detail td { background: #1f283b; }
+  .detail ul { margin: 4px 0; padding-left: 18px; }
+  a { color: var(--acc); }
+  .empty { color: var(--muted); padding: 24px 0; }
+  @media (max-width: 640px) { td.when, th.when { display: none; } }
+</style>
+</head>
+<body>
+<main>
+  <section id="secRep">
+  <h1>Hlášení nepřesností</h1>
+  <p class="sub">Seskupeno podle budovy nebo místa, seřazeno podle počtu hlášení. Jedno zařízení může nahlásit jeden objekt jednou za den.</p>
+  <div class="bar">
+    <label>Aspoň <input id="min" type="number" min="1" value="1" style="width:4em"> hlášení</label>
+    <label>Stav <select id="status"><option value="nove">nová</option><option value="vyreseno">vyřešená</option><option value="zamitnuto">zamítnutá</option></select></label>
+    <button id="ten" type="button">Jen 10 a víc</button>
+    <button id="reload" type="button">Načíst znovu</button>
+  </div>
+  <table>
+    <thead><tr><th>Počet</th><th>Objekt</th><th>Poslední hlášení</th><th class="when">Kdy</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty" hidden>Žádná hlášení.</div>
+  </section>
+
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const KIND = { strecha: 'střecha', barva: 'barva', tvar: 'tvar', chybi: 'chybí budova', jine: 'jiné' };
+async function load() {
+  const r = await fetch(`/api/admin/list?min=${$('min').value}&status=${$('status').value}`).then((x) => x.json());
+  const tb = $('rows'); tb.replaceChildren();
+  $('empty').hidden = r.groups.length > 0;
+  for (const g of r.groups) {
+    const tr = document.createElement('tr'); if (g.n >= 10) tr.className = 'hot';
+    const kinds = g.note || '';
+    const map = g.lat ? `/#@${(+g.lat).toFixed(6)},${(+g.lon).toFixed(6)},0.15,1` : null;   // blízko + značka na místě
+    tr.innerHTML = `<td class="n"></td><td><b></b><div class="kinds"></div></td><td class="kinds"></td><td class="when"></td><td></td>`;
+    tr.children[0].textContent = g.n; tr.children[1].querySelector('b').textContent = g.title || g.target;
+    tr.children[1].querySelector('div').textContent = g.target; tr.children[2].textContent = kinds; tr.children[3].textContent = g.last;
+    const act = tr.children[4];
+    if (map) { const a = document.createElement('a'); a.href = map; a.target = '_blank'; a.textContent = 'Na mapě'; act.append(a, ' '); }
+    const det = document.createElement('button'); det.type = 'button'; det.textContent = 'Detail'; act.append(det, ' ');
+    for (const [st, lab] of [['vyreseno', 'Vyřešeno'], ['zamitnuto', 'Zamítnout'], ['nove', 'Vrátit']]) {
+      if (st === $('status').value) continue;
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = lab;
+      b.onclick = async () => { await fetch('/api/admin/status', { method: 'POST', body: JSON.stringify({ target: g.target, status: st }) }); load(); };
+      act.append(b, ' ');
+    }
+    det.onclick = async () => {
+      if (tr.nextSibling && tr.nextSibling.classList?.contains('detail')) { tr.nextSibling.remove(); return; }
+      const d = await fetch(`/api/admin/detail?target=${encodeURIComponent(g.target)}`).then((x) => x.json());
+      const row = document.createElement('tr'); row.className = 'detail'; const td = document.createElement('td'); td.colSpan = 5;
+      const ul = document.createElement('ul');
+      for (const it of d.items) { const li = document.createElement('li'); li.textContent = `${it.created} · ${it.note || ''}`; ul.append(li); }
+      td.append(ul); row.append(td); tr.after(row);
+    };
+    tb.append(tr);
+  }
+}
+$('reload').onclick = load; $('min').onchange = load; $('status').onchange = load;
+$('ten').onclick = () => { $('min').value = 10; load(); };
+load();
+
+</script>
+</body>
+</html>

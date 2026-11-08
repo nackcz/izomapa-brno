@@ -1,0 +1,20 @@
+# vygenerované (každý si je vyrobí sám)
+node_modules/
+.venv/
+__pycache__/
+build/
+data/
+data_*/
+site/
+.DS_Store
+# podklady, které nepatří do veřejného repa (fotky, screenshoty map)
+fotky/
+podklady/
+
+# Brno-střed: mesto.json a assets/ jsou v repu, aby šla mapa postavit znovu bez stahování z ČÚZK
+/obce/
+
+# hlášení: vlastní konfigurace a hesla serveru
+/wrangler.jsonc
+.dev.vars
+.wrangler/

@@ -1,0 +1,27 @@
+{
+ "nazev": "Brno-střed",
+ "titulek": "Izometrické Brno-střed",
+ "h1": [
+  "Izometrické",
+  "Brno-střed"
+ ],
+ "podtitul": "Centrum Brna z otevřených dat, ve stylu SimCity 2000.",
+ "popis": "Izometrická pixel-art mapa centra Brna (městská část Brno-střed) ve stylu SimCity 2000. Roční období, den a noc, počasí.",
+ "url": "",
+ "stred": [16.579959, 49.17973],
+ "polovina": 1150.0,
+ "ctverce": [
+  [0, 1],
+  [1, 1],
+  [0, 0],
+  [1, 0]
+ ],
+ "href": 205.1,
+ "dno": -40,
+ "mhd": {
+  "gtfs": "https://kordis-jmk.cz/gtfs/gtfs.zip",
+  "zdroj": "KORDIS JMK (IDS JMK), DPMB",
+  "zdroj_url": "https://www.idsjmk.cz"
+ },
+ "vanocni_strom": [49.1952, 16.608]
+}

@@ -1,0 +1,1291 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>render</title>
+<style>html,body{margin:0;background:#000}</style></head>
+<body>
+<script type="importmap">{"imports":{"three":"./node_modules/three/build/three.module.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+THREE.ColorManagement.enabled = false;
+
+// parametry: ?mpp=0.2&tile=1024&season=autumn&mode=day|lights
+const PARAMS = Object.fromEntries(new URLSearchParams(location.search));
+const MPP = parseFloat(PARAMS.mpp || '0.2');
+const TILE = parseInt(PARAMS.tile || '1024');
+const SEASON = PARAMS.season || 'autumn';
+const SEASON_ID = { spring: 0, summer: 1, autumn: 2, winter: 3 }[SEASON];
+const LIGHTS = PARAMS.mode === 'lights';
+const PAD = 4;
+const DIR = PARAMS.dir || 'build';
+const ALPHA = PARAMS.alpha === '1';            // průhledné pozadí (čtverce se skládají přes sebe)
+let SKIRT_EDGES = PARAMS.skirt || 'nsew';     // které okraje mají řez zeminou (výchozí ze scény podle sousedů)
+const BG = LIGHTS ? [0, 0, 0] : [27 / 255, 35 / 255, 51 / 255];
+const SKIRT = 28;
+
+const scene = await (await fetch(`${DIR}/scene.json`)).json();
+const HALF = scene.half, N = scene.n, HS = scene.heights;
+if (!PARAMS.skirt && scene.skirt !== undefined) SKIRT_EDGES = scene.skirt;
+const FLOOR = scene.floor ?? -SKIRT;                 // spodek řezu zeminou (společný pro všechny čtverce)
+const MS = scene.ms || 0, NE = N + 2 * MS, HX = scene.hext || HS;   // výšky i s pásem sousedů
+const HE = HALF + (scene.margin || 0);               // rozšířený výřez (budovy a stromy sousedů u švu)
+const [OFFX, OFFY] = scene.center || [0, 0];        // střed čtverce ve světových souřadnicích
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true, alpha: ALPHA, premultipliedAlpha: false });
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+renderer.setPixelRatio(1);
+renderer.setSize(TILE + 2 * PAD, TILE + 2 * PAD);
+document.body.appendChild(renderer.domElement);
+const world = new THREE.Scene();
+
+// ---------- kamera: dimetrie 2:1 (SimCity 2000), pohled od JZ (musí odpovídat geo.py) ----------
+const EL = Math.asin(Math.tan(Math.atan(0.5)));
+const AZ = THREE.MathUtils.degToRad(225);
+const camDir = new THREE.Vector3(Math.sin(AZ) * Math.cos(EL), Math.sin(EL), -Math.cos(AZ) * Math.cos(EL));
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 8000);
+cam.position.copy(camDir).multiplyScalar(4000);
+cam.lookAt(0, 0, 0);
+cam.updateMatrixWorld();
+const SUN = new THREE.Vector3(0.38, 0.62, 0.68).normalize();
+
+// ---------- společné shadery ----------
+const COMMON = /* glsl */`
+uniform vec3 uSun; uniform vec3 uCam; uniform sampler2D uShadow; uniform mat4 uLightVP; uniform float uSeason; uniform float uLights; uniform vec2 uOff;
+vec3 fn(vec3 n){ return dot(n, uCam) < 0.0 ? -n : n; }
+float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+float band(float d){ return d > 0.72 ? 1.0 : d > 0.42 ? 0.88 : d > 0.12 ? 0.76 : 0.66; }
+float shadow(vec3 wp, vec3 n){
+  vec4 p = uLightVP * vec4(wp + n * 0.3, 1.0);
+  vec3 c = p.xyz / p.w * 0.5 + 0.5;
+  if (c.x < 0.0 || c.x > 1.0 || c.y < 0.0 || c.y > 1.0) return 1.0;
+  return (c.z - 0.00025 > texture2D(uShadow, c.xy).r) ? 0.0 : 1.0;
+}
+vec3 shade(vec3 col, vec3 n, vec3 wp){
+  float d = max(dot(n, uSun), 0.0);
+  float s = shadow(wp, n);
+  float l = band(d * mix(0.25, 1.0, s));
+  vec3 c = col * l;
+  if (s < 0.5) c *= vec3(0.80, 0.84, 0.94);   // namodralý stín
+  return c;
+}
+bool winter(){ return uSeason > 2.5; }
+const vec3 SNOW = vec3(0.92, 0.94, 0.98);`;
+const VERT = /* glsl */`
+attribute vec3 color; attribute vec4 aw;
+varying vec3 vC; varying vec3 vN; varying vec3 vW; varying vec4 vA; varying vec2 vUv;
+void main(){
+  vec4 p = vec4(position, 1.0);
+  vec3 n = normal;
+  vec3 c = color;
+  #ifdef USE_INSTANCING
+    p = instanceMatrix * p;
+    n = normalize(mat3(instanceMatrix) * n);
+  #endif
+  #ifdef USE_INSTANCING_COLOR
+    if (aw.y < 0.5) c *= instanceColor;
+  #endif
+  vec4 w = modelMatrix * p;
+  vW = w.xyz; vN = n; vC = c; vA = aw; vUv = uv;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}`;
+const shadowRT = new THREE.WebGLRenderTarget(8192, 8192, { depthTexture: new THREE.DepthTexture(8192, 8192, THREE.FloatType) });
+const allMats = [];
+function mat(frag, extra = {}, side = THREE.FrontSide) {
+  const m = new THREE.ShaderMaterial({
+    uniforms: {
+      uSun: { value: SUN }, uCam: { value: camDir }, uShadow: { value: shadowRT.depthTexture }, uLightVP: { value: new THREE.Matrix4() },
+      uSeason: { value: SEASON_ID }, uLights: { value: LIGHTS ? 1 : 0 }, uOff: { value: new THREE.Vector2(OFFX, -OFFY) }, ...extra,
+    },
+    vertexShader: VERT, fragmentShader: COMMON + frag, side,
+  });
+  allMats.push(m);
+  return m;
+}
+function geom(B) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(B.p, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(B.n, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(B.c, 3));
+  g.setAttribute('aw', new THREE.Float32BufferAttribute(B.a, 4));
+  return g;
+}
+const newBuf = () => ({ p: [], n: [], c: [], a: [] });
+function pushTri(B, a, b, c, col, aw) {
+  const A = new THREE.Vector3(...a), Bv = new THREE.Vector3(...b), Cv = new THREE.Vector3(...c);
+  const n = Bv.clone().sub(A).cross(Cv.clone().sub(A)).normalize();
+  for (const v of [a, b, c]) { B.p.push(...v); B.n.push(n.x, n.y, n.z); B.c.push(...col); }
+  for (let i = 0; i < 3; i++) B.a.push(...(Array.isArray(aw[0]) ? aw[i] : aw));
+}
+const pushQuad = (B, a, b, c, d, col, aw) => { pushTri(B, a, b, c, col, aw); pushTri(B, a, c, d, col, aw); };
+// osově zarovnaný kvádr v lokálním rámci (s = podél, t = napříč, y = výška)
+function pushBox(B, frame, s0, s1, t0, t1, y0, y1, col, aw, colTop) {
+  const P = (s, t, y) => frame(s, t, y);
+  const c = [P(s0, t0, y0), P(s1, t0, y0), P(s1, t1, y0), P(s0, t1, y0), P(s0, t0, y1), P(s1, t0, y1), P(s1, t1, y1), P(s0, t1, y1)];
+  pushQuad(B, c[0], c[1], c[5], c[4], col, aw); pushQuad(B, c[1], c[2], c[6], c[5], col, aw);
+  pushQuad(B, c[2], c[3], c[7], c[6], col, aw); pushQuad(B, c[3], c[0], c[4], c[7], col, aw);
+  pushQuad(B, c[4], c[5], c[6], c[7], colTop || col, aw);
+}
+const tv = (x, y, z) => [x, z, -y];   // (východ, sever, výška) -> three
+const frameAt = (x, y, z, ang) => (s, t, h) => tv(x + Math.cos(ang) * s - Math.sin(ang) * t, y + Math.sin(ang) * s + Math.cos(ang) * t, z + h);
+const C255 = (rgb) => rgb.map((v) => v / 255);
+
+// ---------- terén ----------
+{
+  const pos = [], uv = [], idx = [];
+  const step = scene.step;
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+    const x = -HALF + c * step, y = HALF - r * step;
+    pos.push(x, HS[r * N + c], -y);
+    uv.push((x + HALF) / (2 * HALF), (y + HALF) / (2 * HALF));
+  }
+  for (let r = 0; r < N - 1; r++) for (let c = 0; c < N - 1; c++) {
+    const a = r * N + c, b = a + 1, d = a + N, e = d + 1;
+    idx.push(a, d, b, b, d, e);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals();
+  const n = g.attributes.position.count;
+  g.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(n * 3).fill(1), 3));
+  g.setAttribute('aw', new THREE.Float32BufferAttribute(new Float32Array(n * 4), 4));
+  const load = async (u) => { const t = await new THREE.TextureLoader().loadAsync(u); t.magFilter = t.minFilter = THREE.NearestFilter; t.generateMipmaps = false; t.colorSpace = THREE.NoColorSpace; return t; };
+  const tex = await load(`${DIR}/ground_${SEASON}.png`);
+  const lmap = await load(`${DIR}/lightmap.png`);
+  lmap.magFilter = lmap.minFilter = THREE.LinearFilter;
+  const m = mat(/* glsl */`
+    uniform sampler2D uTex, uLmap;
+    varying vec3 vN; varying vec3 vW; varying vec2 vUv;
+    void main(){
+      if (uLights > 0.5) {
+        float l = texture2D(uLmap, vUv).r;
+        l = floor(l * 5.0 + hash(floor(gl_FragCoord.xy)) * 0.9) / 5.0;   // stupňovaný kužel = pixel-art
+        gl_FragColor = vec4(vec3(1.0, 0.76, 0.42) * l * 0.85, 1.0); return;
+      }
+      vec3 col = texture2D(uTex, vUv).rgb;
+      vec3 n = normalize(vN);
+      float d = max(dot(n, uSun), 0.0);
+      float s = shadow(vW, n);
+      float l = 0.80 + 0.22 * floor(d * 6.0 + 0.5) / 6.0;
+      col *= l * (s > 0.5 ? 1.0 : 0.74);
+      if (s < 0.5) col *= vec3(0.92, 0.96, 1.08);
+      gl_FragColor = vec4(col, 1.0);
+    }`, { uTex: { value: tex }, uLmap: { value: lmap } });
+  world.add(new THREE.Mesh(g, m));
+
+  // terén sousedů v pásu u švu: jen do hloubky (neviditelný). Obrysy pak na švu nekreslí hranu
+  // a sousední budovy a stromy se správně schovají za kopec.
+  if (MS) {
+    const nb = scene.nb || [];
+    const inNb = (x, y) => nb.some(([di, dj]) => Math.abs(x - di * 2 * HALF) <= HALF && Math.abs(y - dj * 2 * HALF) <= HALF);
+    const pos2 = [], idx2 = [];
+    for (let r = 0; r < NE; r++) for (let c = 0; c < NE; c++) pos2.push(-HALF + (c - MS) * step, HX[r * NE + c], -(HALF - (r - MS) * step));
+    for (let r = 0; r < NE - 1; r++) for (let c = 0; c < NE - 1; c++) {
+      const x = -HALF + (c - MS + 0.5) * step, y = HALF - (r - MS + 0.5) * step;
+      if ((Math.abs(x) < HALF && Math.abs(y) < HALF) || !inNb(x, y)) continue;
+      const a = r * NE + c, b = a + 1, d = a + NE, e = d + 1;
+      idx2.push(a, d, b, b, d, e);
+    }
+    const g2 = new THREE.BufferGeometry();
+    g2.setAttribute('position', new THREE.Float32BufferAttribute(pos2, 3));
+    g2.setIndex(idx2);
+    world.add(new THREE.Mesh(g2, new THREE.MeshBasicMaterial({ colorWrite: false })));
+  }
+
+  // řez zeminou po obvodu ostrova
+  const S = newBuf();
+  const H = (r, c) => HS[r * N + c];
+  const edges = [[(i) => [0, i], [0, 0, -1], 'n'], [(i) => [N - 1, i], [0, 0, 1], 's'], [(i) => [i, 0], [-1, 0, 0], 'w'], [(i) => [i, N - 1], [1, 0, 0], 'e']].filter((e) => SKIRT_EDGES.includes(e[2]));
+  for (const [rc, nrm] of edges) for (let i = 0; i < N - 1; i++) {
+    const [r0, c0] = rc(i), [r1, c1] = rc(i + 1);
+    const p0 = [-HALF + c0 * step, H(r0, c0), -(HALF - r0 * step)], p1 = [-HALF + c1 * step, H(r1, c1), -(HALF - r1 * step)];
+    const b0 = [p0[0], FLOOR, p0[2]], b1 = [p1[0], FLOOR, p1[2]];
+    for (const v of [p0, b0, p1, p1, b0, b1]) { S.p.push(...v); S.n.push(...nrm); S.c.push(1, 1, 1); S.a.push(0, 0, 0, 0); }
+  }
+  world.add(new THREE.Mesh(geom(S), mat(/* glsl */`
+    varying vec3 vN; varying vec3 vW;
+    void main(){
+      if (uLights > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+      float y = vW.y;
+      vec3 col = vec3(0.47, 0.33, 0.22);
+      if (y < 20.0) col = vec3(0.55, 0.40, 0.27);
+      if (y < 0.0) col = vec3(0.40, 0.36, 0.33);
+      if (y < -14.0) col = vec3(0.33, 0.30, 0.29);
+      if (fract((vW.x + vW.z) * 0.37 + y * 0.9) < 0.08) col *= 0.85;
+      col *= (abs(vN.x) > 0.5) ? 0.82 : 1.0;
+      gl_FragColor = vec4(col, 1.0);
+    }`, {}, THREE.DoubleSide)));
+}
+
+// ---------- materiály budov ----------
+const wallMat = mat(/* glsl */`
+  varying vec3 vC; varying vec3 vN; varying vec3 vW; varying vec4 vA;
+  float win(float u, float len, float sp, float w){
+    float n = floor((len - 0.6) / sp);
+    if (n < 1.0) return 0.0;
+    float off = (len - n * sp) * 0.5;
+    float q = (u - off) / sp;
+    if (q < 0.0 || q >= n) return 0.0;
+    return abs(fract(q) - 0.5) < w / (2.0 * sp) ? 1.0 : 0.0;
+  }
+  void main(){
+    vec3 n = fn(normalize(vN));
+    vec3 col = vC;
+    float u = vA.x, v = vA.y, len = vA.z, st = vA.w;
+    bool w = false; bool door = false;
+    float cell = 0.0;
+    if (v > 0.0) {
+      if (st > 14.5) {                // velká hala: skoro plná zeď, jen pár malých okének
+        float a = floor(u / 6.4), r = floor(v / 5.2);
+        w = fract(u / 6.4) > 0.72 && fract(v / 5.2) > 0.55 && fract(v / 5.2) < 0.78 && hash(vec2(a, r) + len) > 0.5;
+      } else if (st > 13.5) {                // sklo a kámen (moderní stavby): pásy skla s příčkami
+        w = fract(u / 1.6) > 0.12 && fract(v / 3.6) > 0.1;
+        if (w && fract(u / 9.6) < 0.25) { w = false; }
+      } else if (st > 12.5) {         // zámek: bílá omítka, červené šambrány a nárožní pásy
+        float f = fract(v / 3.6) * 3.6;
+        cell = floor(v / 3.6);
+        bool win2 = win(u, len, 3.0, 1.2) > 0.5 && f > 0.9 && f < 2.6;
+        bool fr = win(u, len, 3.0, 1.7) > 0.5 && f > 0.6 && f < 2.9;
+        w = win2;
+        if (!w && fr) col = vec3(0.70, 0.22, 0.16);
+        if (u < 0.6 || u > len - 0.6) col = vec3(0.70, 0.22, 0.16);
+      } else if (st < 0.5) {                 // rodinný dům
+        float f = fract(v / 2.9) * 2.9;
+        w = win(u, len, 3.0, 1.2) > 0.5 && f > 0.9 && f < 2.2 && v > 0.6;
+        cell = floor(v / 2.9);
+      } else if (st < 1.5) {          // panelák
+        float f = fract(v / 2.8) * 2.8;
+        w = win(u, len, 2.4, 1.5) > 0.5 && f > 0.8 && f < 2.2 && v > 2.0;
+        if (fract(v / 2.8) < 0.08) col *= 0.9;
+        cell = floor(v / 2.8);
+      } else if (st < 2.5) {          // garáž – vrata
+        door = win(u, len, 3.0, 2.3) > 0.5 && v < 2.1;
+      } else if (st < 3.5) {          // hala / obchodní centrum – pás oken v každém podlaží, prosklený parter
+        float f = fract(v / 4.2) * 4.2;
+        w = win(u, len, 1.0, 0.8) > 0.5 && f > 2.4 && f < 3.6;
+        if (v < 3.4) w = win(u, len, 2.0, 1.6) > 0.5 && v > 0.4 && v < 3.0 && fract(floor(u / 8.0) * 0.37) > 0.3;
+        if (f < 0.25 && v > 1.0) col *= 0.9;
+      } else if (st < 4.5) {          // kostel – vysoká úzká okna
+        w = win(u, len, 3.2, 0.9) > 0.5 && ((v > 3.0 && v < 8.5) || (v > 22.0 && v < 27.0));
+        cell = floor(v / 10.0);
+        if (v < 1.1) col = vec3(0.56, 0.55, 0.53);            // žulový sokl
+      } else if (st < 5.5) {
+      } else if (st > 10.5) {                 // činžák: parter s výlohami, kordonové římsy, šambrány kolem oken
+        float f = fract(v / 3.2) * 3.2;
+        cell = floor(v / 3.2);
+        if (v < 3.5) {
+          w = win(u, len, 3.4, 2.3) > 0.5 && v > 0.45 && v < 2.8;
+          if (v < 0.45) col *= 0.72;
+          if (v > 3.05) col *= 0.82;
+        } else {
+          w = win(u, len, 2.3, 1.05) > 0.5 && f > 0.95 && f < 2.5;
+          if (f < 0.2) col *= 0.88;
+          if (!w && win(u, len, 2.3, 1.45) > 0.5 && f > 0.78 && f < 2.68) col *= 1.1;
+        }
+      } else {                        // art deco: pilastry, římsy, ozdobná atika
+        float f = fract(v / 3.3) * 3.3;
+        cell = floor(v / 3.3);
+        float pu = mod(u, 3.2);
+        if (pu < 0.5) col *= 1.06;
+        if (pu < 0.08 || abs(pu - 0.5) < 0.06) col *= 0.82;
+        if (f < 0.22) col *= 0.86;
+        w = pu > 1.0 && pu < 2.7 && f > 0.9 && f < 2.8;
+        if (v < 3.4) { w = pu > 0.9 && pu < 2.8 && v > 0.4 && v < 3.0; if (v < 0.4) col = vec3(0.55, 0.53, 0.50); }
+      }
+    }
+    if (st > 4.5 && st < 5.5) w = abs(u - len * 0.5) < 0.55 && v > -1.3 && v < -0.25;   // vikýř: okno pod horní hranou
+    float hh = hash(floor((vW.xz + uOff) / 3.0) + vec2(cell * 7.0, floor(u / 2.4)));   // světové souřadnice = stejně přes šev
+    if (uLights > 0.5) {
+      vec3 e = vec3(0.0);
+      if (w) {
+        if (hh > 0.52) e = vec3(1.0, 0.80, 0.46) * (0.75 + 0.25 * hh);
+        else if (hh > 0.44) e = vec3(0.62, 0.74, 1.0) * 0.55;     // televize / chladné světlo
+      }
+      if (st > 3.5 && st < 4.5 && w) e = vec3(1.0, 0.72, 0.38) * 0.9;
+      gl_FragColor = vec4(e, 1.0); return;
+    }
+    if (w) col = vec3(0.30, 0.38, 0.50) + (hh > 0.85 ? vec3(0.30, 0.28, 0.14) : vec3(0.0));
+    if (door) col = vec3(0.52, 0.52, 0.54);
+    if (v < 0.5 && v > -50.0) col *= 0.82;
+    gl_FragColor = vec4(shade(col, n, vW), 1.0);
+  }`, {}, THREE.DoubleSide);
+const roofMat = mat(/* glsl */`
+  varying vec3 vC; varying vec3 vN; varying vec3 vW; varying vec4 vA;
+  void main(){
+    if (uLights > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+    vec3 n = fn(normalize(vN));
+    vec3 col = vC;
+    if (vA.x > 0.5) {
+      if (fract(vW.y / 0.6) < 0.3) col *= 0.88;
+      if (vA.y > 0.0 && vW.y > vA.y - 0.25) col *= 0.74;          // hřebenáče
+      if (vA.z > 0.0 && vW.y < vA.z + 0.16) col *= 0.80;          // okap
+    }
+    else { if (fract((vW.x + uOff.x) / 9.0 + 0.1) < 0.05 && fract((vW.z + uOff.y) / 7.0) < 0.15) col *= 0.8; }
+    if (winter() && n.y > 0.3) {
+      col = SNOW;
+      if (vA.x > 0.5 && fract(vW.y / 0.6) < 0.12 && hash(floor(gl_FragCoord.xy)) > 0.6) col *= 0.93;
+    }
+    gl_FragColor = vec4(shade(col, n, vW), 1.0);
+  }`, {}, THREE.DoubleSide);
+// obecný materiál pro mobiliář, auta, komíny...  aw.x = svítí, aw.y = nebarvit instancí, aw.z = v zimě sníh nahoře
+const solidMat = mat(/* glsl */`
+  varying vec3 vC; varying vec3 vN; varying vec3 vW; varying vec4 vA;
+  void main(){
+    if (uLights > 0.5) { gl_FragColor = vec4(vA.x > 0.5 ? vec3(1.0, 0.86, 0.6) * vA.x : vec3(0.0), 1.0); return; }
+    vec3 n = fn(normalize(vN));
+    vec3 col = vC;
+    if (winter() && vA.z > 0.5 && n.y > 0.6) col = SNOW;
+    gl_FragColor = vec4(shade(col, n, vW), 1.0);
+  }`, {}, THREE.DoubleSide);
+
+// ---------- budovy ----------
+function pointInPoly(x, y, P) { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const [xi, yi] = P[i], [xj, yj] = P[j]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; } return c; }
+// výbava střechy podle satelitu (dominanty se zónami): 0 = shedy, 1 = pás (světlík, rám skla, značení), 2 = fotovoltaika,
+// 3 = valený oblouk, 4 = sedlový hřeben s pásem světlíků
+function roofDeco(b, X, eave, rc) {
+  const both = (a, b_, c, d, col) => { pushQuad(X, a, b_, c, d, col, [0, 1, 0, 0]); pushQuad(X, a, d, c, b_, col, [0, 1, 0, 0]); };
+  for (const [k, x0, y0, x1, y1, w, h, r, g, bl, ...rest] of b.dz) {
+    const L = Math.hypot(x1 - x0, y1 - y0), f = frameAt(x0, y0, eave, Math.atan2(y1 - y0, x1 - x0)), col = [r / 255, g / 255, bl / 255];
+    if (k === 0) {
+      // prosklená svislá strana shedu vždy ke kameře (pohled od jihozápadu), jinak by řady splynuly se střechou
+      const an = Math.atan2(y1 - y0, x1 - x0), sg = Math.sin(an) - Math.cos(an) > 0 ? 1 : -1;
+      const t0 = -sg * w / 2, t1 = sg * (w / 2 - 0.35);
+      both(f(0, t0, 0.02), f(L, t0, 0.02), f(L, t1, h), f(0, t1, h), rc.map((q) => q * 0.78));
+      both(f(0, t1, h), f(L, t1, h), f(L, t1, 0.02), f(0, t1, 0.02), col);
+      both(f(0, t1, h), f(L, t1, h), f(L, sg * w / 2, h - 0.05), f(0, sg * w / 2, h - 0.05), rc.map((q) => q * 0.7));
+    } else if (k === 1) {
+      pushBox(X, f, 0, L, -w / 2, w / 2, 0, h, col.map((q) => q * 0.78), [0, 1, 0, 0], col);
+    } else if (k === 2) {
+      both(f(0, -w / 2, 0.15), f(L, -w / 2, 0.15), f(L, w / 2, 0.5), f(0, w / 2, 0.5), col);
+    } else if (k === 3) {                                               // valený oblouk (prosklený světlík, hala)
+      const n = 8, P = (i) => { const a = Math.PI * i / n; return [-Math.cos(a) * w / 2, Math.sin(a) * h]; };
+      for (let i = 0; i < n; i++) {
+        const [t0, z0] = P(i), [t1, z1] = P(i + 1), sh = 0.86 + 0.14 * Math.sin(Math.PI * (i + 0.5) / n);
+        both(f(0, t0, z0), f(L, t0, z0), f(L, t1, z1), f(0, t1, z1), col.map((q) => q * sh));
+        for (const s_ of [0, L]) { pushTri(X, f(s_, 0, 0), f(s_, t0, z0), f(s_, t1, z1), col.map((q) => q * 0.8), [0, 1, 0, 0]); pushTri(X, f(s_, 0, 0), f(s_, t1, z1), f(s_, t0, z0), col.map((q) => q * 0.8), [0, 1, 0, 0]); }
+      }
+    } else {                                                            // sedlový hřeben, volitelně s pásem světlíků u hřebene
+      const sk = rest.length ? [rest[0] / 255, rest[1] / 255, rest[2] / 255] : null;
+      for (const sd of [-1, 1]) {
+        both(f(0, sd * w / 2, 0), f(L, sd * w / 2, 0), f(L, 0, h), f(0, 0, h), col.map((q) => q * (sd < 0 ? 1 : 0.82)));
+        if (sk) both(f(1, sd * w * 0.24, h * 0.52 + 0.06), f(L - 1, sd * w * 0.24, h * 0.52 + 0.06), f(L - 1, sd * w * 0.12, h * 0.76 + 0.06), f(1, sd * w * 0.12, h * 0.76 + 0.06), sk);
+      }
+      for (const s_ of [0, L]) both(f(s_, -w / 2, 0), f(s_, w / 2, 0), f(s_, 0, h), f(s_, 0, h), col.map((q) => q * 0.7));
+    }
+  }
+}
+
+{
+  const W = newBuf(), R = newBuf(), X = newBuf();
+  const deg = THREE.MathUtils.degToRad;
+  for (const b of scene.buildings) {
+    if (b.only) continue;            // samostatná věž dominanty (kreslí se níž)
+    if (b.s === 12) {               // přístřešek: deska střechy na sloupech, bez stěn
+      const ring = b.p, rc = C255(b.rc), e = b.e, th = 0.35;
+      const pts = ring.map(([x, y]) => new THREE.Vector2(x, y));
+      for (const [i, j, k] of THREE.ShapeUtils.triangulateShape(pts, [])) {
+        const A = tv(...ring[i], e), Bp = tv(...ring[j], e), Cp = tv(...ring[k], e);
+        const nn = new THREE.Vector3(...Bp).sub(new THREE.Vector3(...A)).cross(new THREE.Vector3(...Cp).sub(new THREE.Vector3(...A)));
+        if (nn.y < 0) pushTri(R, A, Cp, Bp, rc, [0, 0, 0, 0]); else pushTri(R, A, Bp, Cp, rc, [0, 0, 0, 0]);
+      }
+      for (let i = 0; i < ring.length; i++) {
+        const [x0, y0] = ring[i], [x1, y1] = ring[(i + 1) % ring.length];
+        const len = Math.hypot(x1 - x0, y1 - y0);
+        pushQuad(X, tv(x0, y0, e - th), tv(x1, y1, e - th), tv(x1, y1, e), tv(x0, y0, e), rc.map((v) => v * 0.75), [0, 1, 1, 0]);
+        const ang = Math.atan2(y1 - y0, x1 - x0), n = Math.max(1, Math.round(len / 9));
+        for (let k = 0; k < n; k++) {
+          const t = (k + 0.5) / n, f = frameAt(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, 0, ang);
+          pushBox(X, f, -0.15, 0.15, -0.6, -0.3, b.b, e - th, [0.42, 0.44, 0.46], [0, 1, 0, 0]);
+        }
+      }
+      continue;
+    }
+    const ring = b.p, wc = C255(b.wc);
+    let rc = C255(b.rc);
+    const church = b.lm === 'church', rot = false;
+    let eave = b.e;
+    if (church) { eave = b.g + (b.cht ? b.cht[0] : 11); rc = [0.30, 0.32, 0.36]; }
+    if (rot) { eave = b.g + 10; rc = [0.36, 0.40, 0.44]; }
+    let wcol = wc;
+    if (rot) wcol = [0.93, 0.91, 0.85];
+    if (b.lm === 'artdeco') wcol = [0.92, 0.88, 0.78];
+    const wst = b.lm === 'radnice' ? 8 : church || rot ? 4 : b.lm === 'artdeco' ? 8 : b.s;
+    const eRel = eave - b.g;
+    for (let i = 0; i < ring.length; i++) {
+      const [x0, y0] = ring[i], [x1, y1] = ring[(i + 1) % ring.length];
+      const len = Math.hypot(x1 - x0, y1 - y0);
+      if (len < 0.05) continue;
+      const st = wst, lo = b.b - b.g;
+      pushQuad(W, tv(x0, y0, b.b), tv(x1, y1, b.b), tv(x1, y1, eave), tv(x0, y0, eave), wcol,
+        [[0, lo, len, st], [len, lo, len, st], [len, eRel, len, st]]);
+      // druhý trojúhelník čtyřúhelníku má jiné rohy -> doplnit atributy ručně
+      W.a.splice(W.a.length - 12, 12, 0, lo, len, st, len, eRel, len, st, 0, eRel, len, st);
+    }
+    if (b.r === 'flat' || !b.parts.length || rot) {
+      const pts = ring.map(([x, y]) => new THREE.Vector2(x, y));
+      for (const [i, j, k] of THREE.ShapeUtils.triangulateShape(pts, [])) {
+        const P = (q) => tv(ring[q][0], ring[q][1], eave);
+        const A = P(i), Bp = P(j), Cp = P(k);
+        const nn = new THREE.Vector3(...Bp).sub(new THREE.Vector3(...A)).cross(new THREE.Vector3(...Cp).sub(new THREE.Vector3(...A)));
+        if (nn.y < 0) pushTri(R, A, Cp, Bp, rc, [0, 0, 0, 0]); else pushTri(R, A, Bp, Cp, rc, [0, 0, 0, 0]);
+      }
+      // atika paneláků a hal
+      if (b.s === 1 || b.s === 3 || b.fx) for (let i = 0; i < ring.length; i++) {
+        const [x0, y0] = ring[i], [x1, y1] = ring[(i + 1) % ring.length];
+        pushQuad(X, tv(x0, y0, eave), tv(x1, y1, eave), tv(x1, y1, eave + 0.5), tv(x0, y0, eave + 0.5), b.fx ? [0.88, 0.84, 0.77] : rc.map((v) => v * 0.8), [0, 1, 1, 0]);
+      }
+      // strojovny výtahů a větrání na plochých střechách paneláků
+      if ((b.s === 1 || b.fx) && !rot) {
+        let best = 0, ang = 0;
+        for (let i = 0; i < ring.length; i++) { const [x0, y0] = ring[i], [x1, y1] = ring[(i + 1) % ring.length]; const l = Math.hypot(x1 - x0, y1 - y0); if (l > best) { best = l; ang = Math.atan2(y1 - y0, x1 - x0); } }
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+        let s0 = 1e9, s1 = -1e9, t0 = 1e9, t1 = -1e9;
+        for (const [x, y] of ring) { const s_ = x * ca + y * sa, t_ = -x * sa + y * ca; s0 = Math.min(s0, s_); s1 = Math.max(s1, s_); t0 = Math.min(t0, t_); t1 = Math.max(t1, t_); }
+        const tm = (t0 + t1) / 2, pg = ring.map(([x, y]) => new THREE.Vector2(x, y));
+        for (let s_ = s0 + 9; s_ < s1 - 6; s_ += 21.6) {
+          const x = s_ * ca - tm * sa, y = s_ * sa + tm * ca;
+          if (!pointInPoly(x, y, ring)) continue;
+          pushBox(X, frameAt(x, y, eave, ang), -1.8, 1.8, -1.4, 1.4, 0, 2.4, [0.80, 0.78, 0.74], [0, 1, 1, 0], [0.62, 0.62, 0.62]);
+        }
+      }
+      // technologie na ploché střeše: VZT jednotky (0), světlíky (1), nástavby (2)
+      if (b.rt) for (const [x, y, t, a] of b.rt) {
+        const f = frameAt(x, y, eave, a);
+        if (t === 0) pushBox(X, f, -1.1, 1.1, -0.8, 0.8, 0, 1.2, [0.70, 0.71, 0.72], [0, 1, 1, 0], [0.80, 0.81, 0.82]);
+        else if (t === 1) pushBox(X, f, -1.6, 1.6, -1.0, 1.0, 0, 0.35, [0.55, 0.58, 0.62], [0, 1, 0, 0], [0.42, 0.56, 0.66]);
+        else pushBox(X, f, -2.2, 2.2, -1.8, 1.8, 0, 2.4, rc.map((q) => q * 1.05), [0, 1, 1, 0], rc.map((q) => q * 0.9));
+      }
+      if (b.dz) roofDeco(b, X, eave, rc);
+      continue;
+    }
+    // plochá výplň pod šikmou střechou, aby části půdorysu mimo střešní obdélníky nebyly otevřené
+    if (b.parts.length) {            // všechny šikmé střechy (střešní obdélníky často nepokryjí celý půdorys)
+      const pts = ring.map(([x, y]) => new THREE.Vector2(x, y));
+      for (const [i, j, k] of THREE.ShapeUtils.triangulateShape(pts, [])) {
+        const A = tv(...ring[i], eave), Bp = tv(...ring[j], eave), Cp = tv(...ring[k], eave);
+        const nn = new THREE.Vector3(...Bp).sub(new THREE.Vector3(...A)).cross(new THREE.Vector3(...Cp).sub(new THREE.Vector3(...A)));
+        if (nn.y < 0) pushTri(R, A, Cp, Bp, rc, [0, 0, 0, 0]); else pushTri(R, A, Bp, Cp, rc, [0, 0, 0, 0]);
+      }
+    }
+    const chapel = b.lm === 'chapel';
+    const pitch = church ? deg(55) : chapel ? deg(52) : b.lm === 'radnice' ? deg(52) : deg(40);
+    for (const [cx, cy, ang, L, Wd] of b.parts) {
+      const rh = church || chapel || b.lm === 'radnice' ? Math.min(Wd / 2 * Math.tan(pitch), 12) : Math.min(Wd / 2 * Math.tan(pitch), b.rh || 7);
+      const f = frameAt(cx, cy, 0, ang);
+      const OV = 0.45, hl = L / 2 + OV, hw = Wd / 2 + OV;
+      const top = eave + rh, eav = eave - OV * Math.tan(pitch);
+      const rl = b.r === 'gabled' || church ? hl : b.r === 'hipped' ? Math.max(hl - hw, 0) : 0;
+      const r0 = f(-rl, 0, top), r1 = f(rl, 0, top);
+      const c00 = f(-hl, -hw, eav), c10 = f(hl, -hw, eav), c11 = f(hl, hw, eav), c01 = f(-hl, hw, eav);
+      const S = [1, top, eav, 0];
+      pushQuad(R, c00, c10, r1, r0, rc, S);
+      pushQuad(R, c11, c01, r0, r1, rc, S);
+      if (b.r === 'gabled' || church) {
+        const nw = [0, -100, 1, 0];
+        pushTri(W, f(-L / 2, Wd / 2, eave), f(-L / 2, -Wd / 2, eave), f(-L / 2, 0, top), wc, nw);
+        pushTri(W, f(L / 2, -Wd / 2, eave), f(L / 2, Wd / 2, eave), f(L / 2, 0, top), wc, nw);
+      } else {
+        pushTri(R, c01, c00, r0, rc, S); pushTri(R, c10, c11, r1, rc, S);
+      }
+      // vikýře na největší části velké sedlové střechy, na obou stranách hřebene
+      if (b.dm && L > 9 && L * Wd === Math.max(...b.parts.map((z) => z[3] * z[4]))) {
+        for (const side of [-1, 1]) {
+          const t1 = hw * 0.78 * side, yTop = eave + rh * 0.62, hb = yTop - eave;
+          const a = f(-1.2, t1, eave), bq = f(1.2, t1, eave), c = f(1.2, t1, yTop), d = f(-1.2, t1, yTop);
+          pushQuad(W, a, bq, c, d, wc, [0, 0, 0, 0]);
+          W.a.splice(W.a.length - 24, 24, 0, -hb, 2.4, 5, 2.4, -hb, 2.4, 5, 2.4, 0, 2.4, 5, 0, -hb, 2.4, 5, 2.4, 0, 2.4, 5, 0, 0, 2.4, 5);
+          const nw = [0, -100, 1, 0];
+          pushQuad(W, f(-1.2, 0, eave), f(-1.2, t1, eave), f(-1.2, t1, yTop), f(-1.2, 0, yTop), wc, nw);
+          pushQuad(W, f(1.2, t1, eave), f(1.2, 0, eave), f(1.2, 0, yTop), f(1.2, t1, yTop), wc, nw);
+          const t2 = t1 + 0.3 * side;
+          pushQuad(R, f(-1.4, 0, yTop + 0.15), f(1.4, 0, yTop + 0.15), f(1.4, t2, yTop - 0.05), f(-1.4, t2, yTop - 0.05), rc, [1, 0, 0, 0]);
+        }
+      }
+    }
+    // komín
+    if (b.ch) {
+      const [hx, hy, ht] = b.ch;
+      const f = frameAt(hx, hy, 0, b.parts[0][2]);
+      pushBox(X, f, -0.38, 0.38, -0.38, 0.38, ht - 3.2, ht, [0.58, 0.33, 0.26], [0, 1, 1, 0], [0.30, 0.24, 0.22]);
+    }
+    // velitelství Horních kasáren: věžička s hodinami uprostřed hřebene
+    if (b.lm === 'hq' && b.parts.length) {
+      const [cx, cy, ang, L, Wd] = b.parts.reduce((a, q) => (q[3] * q[4] > a[3] * a[4] ? q : a));
+      const top = eave + Math.min(Wd / 2 * Math.tan(deg(40)), b.rh || 7);
+      const f = frameAt(cx, cy, 0, ang), T = 1.6;
+      pushBox(X, f, -T, T, -T, T, top - 2.0, top + 4.2, wcol, [0, 1, 0, 0]);
+      for (const [s0, t0, s1, t1] of [[-T, -T, T, -T], [T, -T, T, T], [T, T, -T, T], [-T, T, -T, -T]])
+        pushTri(R, f(s0 * 1.15, t0 * 1.15, top + 4.2), f(s1 * 1.15, t1 * 1.15, top + 4.2), f(0, 0, top + 7.2), [0.30, 0.42, 0.40], [0, 0, 0, 0]);
+      pushBox(X, f, -0.06, 0.06, -0.06, 0.06, top + 7.2, top + 8.4, [0.85, 0.72, 0.30], [0, 1, 0, 0]);
+      for (const t of [-T - 0.02, T + 0.02]) pushBox(X, f, -0.75, 0.75, t - 0.02, t + 0.02, top + 2.0, top + 3.5, [0.95, 0.93, 0.85], [0.6, 1, 0, 0]);
+      for (const sv of [-T - 0.02, T + 0.02]) pushBox(X, f, sv - 0.02, sv + 0.02, -0.75, 0.75, top + 2.0, top + 3.5, [0.95, 0.93, 0.85], [0.6, 1, 0, 0]);
+    }
+    // radnice: hlavní věž uprostřed průčelí a dvě menší po stranách (novorenesance, měděné báně)
+    if (b.lm === 'radnice' && b.rad) {
+      const [fx_, fy_, tang, out] = b.rad;
+      const tower = (off, inset, T, shaftTop, spireTop) => {
+        const x = fx_ + Math.cos(tang) * off - Math.cos(out) * inset, y = fy_ + Math.sin(tang) * off - Math.sin(out) * inset;
+        const f = frameAt(x, y, 0, tang), cs = [[-T, -T], [T, -T], [T, T], [-T, T]];
+        for (let i = 0; i < 4; i++) {
+          const [s0, t0] = cs[i], [s1, t1] = cs[(i + 1) % 4];
+          pushQuad(W, f(s0, t0, b.b), f(s1, t1, b.b), f(s1, t1, shaftTop), f(s0, t0, shaftTop), wcol, [0, 0, 0, 0]);
+          W.a.splice(W.a.length - 24, 24, 0, b.b - b.g, 2 * T, 8, 2 * T, b.b - b.g, 2 * T, 8, 2 * T, shaftTop - b.g, 2 * T, 8, 0, b.b - b.g, 2 * T, 8, 2 * T, shaftTop - b.g, 2 * T, 8, 0, shaftTop - b.g, 2 * T, 8);
+        }
+        pushBox(X, f, -T - 0.4, T + 0.4, -T - 0.4, T + 0.4, shaftTop - 0.6, shaftTop, wcol.map((q) => q * 0.85), [0, 1, 1, 0]);
+        const COP = [0.36, 0.56, 0.50], mid = shaftTop + (spireTop - shaftTop) * 0.35;
+        for (let i = 0; i < 4; i++) {
+          const [s0, t0] = cs[i], [s1, t1] = cs[(i + 1) % 4];
+          pushQuad(R, f(s0 * 1.08, t0 * 1.08, shaftTop), f(s1 * 1.08, t1 * 1.08, shaftTop), f(s1 * 0.55, t1 * 0.55, mid), f(s0 * 0.55, t0 * 0.55, mid), COP, [0, 0, 0, 0]);
+          pushTri(R, f(s0 * 0.55, t0 * 0.55, mid), f(s1 * 0.55, t1 * 0.55, mid), f(0, 0, spireTop), COP, [0, 0, 0, 0]);
+        }
+        pushBox(X, f, -0.07, 0.07, -0.07, 0.07, spireTop, spireTop + 2.2, [0.82, 0.70, 0.32], [0, 1, 0, 0]);
+        return f;
+      };
+      const mf = tower(0, 3.0, 3.4, b.g + 44, b.g + 63);
+      for (const t of [-1, 1]) pushBox(X, mf, -1.2, 1.2, t * 3.42 - 0.02, t * 3.42 + 0.02, b.g + 37, b.g + 39.5, [0.95, 0.93, 0.85], [0.6, 1, 0, 0]);
+      for (const sv of [-1, 1]) pushBox(X, mf, sv * 3.42 - 0.02, sv * 3.42 + 0.02, -1.2, 1.2, b.g + 37, b.g + 39.5, [0.95, 0.93, 0.85], [0.6, 1, 0, 0]);
+      tower(-15, 2.4, 2.4, b.g + 27, b.g + 37);
+      tower(15, 2.4, 2.4, b.g + 27, b.g + 37);
+    }
+    // hřbitovní kaple: kříž na štítu
+    if (b.lm === 'chapel' && b.parts.length) {
+      const [cx, cy, ang, L, Wd] = b.parts[0];
+      const top = eave + Math.min(Wd / 2 * Math.tan(deg(52)), 12);
+      const f = frameAt(cx + Math.cos(ang) * L / 2, cy + Math.sin(ang) * L / 2, 0, ang);
+      pushBox(X, f, -0.07, 0.07, -0.07, 0.07, top, top + 1.4, [0.85, 0.72, 0.30], [0, 1, 0, 0]);
+      pushBox(X, f, -0.07, 0.07, -0.4, 0.4, top + 0.85, top + 1.0, [0.85, 0.72, 0.30], [0, 1, 0, 0]);
+    }
+    // kostel: věž s jehlanem na západní straně lodi
+    if (church) {
+      const [cx, cy, ang, L, Wd] = b.parts.reduce((a, q) => (q[3] * q[4] > a[3] * a[4] ? q : a));
+      const dir = Math.cos(ang) > 0 ? -1 : 1;           // konec lodi, který je víc na západ
+      const ts = Math.min(Wd * 0.62, 7.5);
+      const tx = cx + Math.cos(ang) * dir * (L / 2 - ts / 2 + 1.2), ty = cy + Math.sin(ang) * dir * (L / 2 - ts / 2 + 1.2);
+      const f = frameAt(tx, ty, 0, ang);
+      const h0 = b.b, h1 = b.g + (b.cht ? b.cht[1] : 31), h2 = b.g + (b.cht ? b.cht[2] : 47);
+      const T = ts / 2;
+      const corners = [[-T, -T], [T, -T], [T, T], [-T, T]];
+      for (let i = 0; i < 4; i++) {
+        const [s0, t0] = corners[i], [s1, t1] = corners[(i + 1) % 4];
+        pushQuad(W, f(s0, t0, h0), f(s1, t1, h0), f(s1, t1, h1), f(s0, t0, h1), wc, [0, 0, 0, 0]);
+        W.a.splice(W.a.length - 24, 24, 0, h0 - b.g, ts, 4, ts, h0 - b.g, ts, 4, ts, h1 - b.g, ts, 4, 0, h0 - b.g, ts, 4, ts, h1 - b.g, ts, 4, 0, h1 - b.g, ts, 4);
+      }
+      // římsa a jehlan
+      pushBox(X, f, -T - 0.4, T + 0.4, -T - 0.4, T + 0.4, h1 - 31 + 31 - 0.6 + 0, h1 + 0.2, wc.map((v) => v * 0.85), [0, 1, 1, 0]);
+      const sp = [0.33, 0.45, 0.42];
+      for (let i = 0; i < 4; i++) {
+        const [s0, t0] = corners[i], [s1, t1] = corners[(i + 1) % 4];
+        pushTri(R, f(s0 * 1.05, t0 * 1.05, h1 + 0.2), f(s1 * 1.05, t1 * 1.05, h1 + 0.2), f(0, 0, h2), sp, [0, 0, 0, 0]);
+      }
+      pushBox(X, f, -0.08, 0.08, -0.08, 0.08, h2, h2 + 2.2, [0.85, 0.72, 0.30], [0, 1, 0, 0]);   // kříž
+      pushBox(X, f, -0.08, 0.08, -0.7, 0.7, h2 + 1.3, h2 + 1.5, [0.85, 0.72, 0.30], [0, 1, 0, 0]);
+      // hodiny
+      pushBox(X, f, -1.0, 1.0, -T - 0.05, -T + 0.01, h1 - 5, h1 - 3, [0.95, 0.93, 0.85], [0.6, 1, 0, 0]);
+    }
+  }
+  // ---- dominanty podle fotek: věže (hranolové / válcové) se střechou, komíny, nástavby, přesahy střech ----
+  const ring = (B, f, r0, r1, z0, z1, n, col, aw, rot = 0) => {        // komolý jehlan / kužel s n stranami
+    for (let i = 0; i < n; i++) {
+      const a0 = rot + i / n * Math.PI * 2, a1 = rot + (i + 1) / n * Math.PI * 2;
+      const P = (r, a, z) => f(Math.cos(a) * r, Math.sin(a) * r, z);
+      if (r1 > 0.001) pushQuad(B, P(r0, a0, z0), P(r0, a1, z0), P(r1, a1, z1), P(r1, a0, z1), col, aw);
+      else pushTri(B, P(r0, a0, z0), P(r0, a1, z0), f(0, 0, z1), col, aw);
+    }
+  };
+  const GOLDC = [0.85, 0.72, 0.30];
+  for (const b of scene.buildings) {
+    for (const t of b.tw || []) {
+      const f = frameAt(t.x, t.y, 0, t.a), T = t.w / 2, n = t.round ? 10 : 4, rot = t.round ? 0 : Math.PI / 4;
+      const R0 = t.round ? T : T * Math.SQRT2;
+      const wcol = C255(t.stone ? [150, 146, 136] : t.wc), tc = C255(t.tc);
+      // dřík s okny (styl kostela), u kamenných věží bez oken
+      for (let i = 0; i < n; i++) {
+        const a0 = rot + i / n * Math.PI * 2, a1 = rot + (i + 1) / n * Math.PI * 2;
+        const p0 = [Math.cos(a0) * R0, Math.sin(a0) * R0], p1 = [Math.cos(a1) * R0, Math.sin(a1) * R0];
+        const len = Math.hypot(p1[0] - p0[0], p1[1] - p0[1]), lo = t.b - b.g, hi = t.h - b.g, st = t.stone ? 2 : 4;
+        pushQuad(W, f(p0[0], p0[1], t.b), f(p1[0], p1[1], t.b), f(p1[0], p1[1], t.h), f(p0[0], p0[1], t.h), wcol, [0, 0, 0, 0]);
+        W.a.splice(W.a.length - 24, 24, 0, lo, len, st, len, lo, len, st, len, hi, len, st, 0, lo, len, st, len, hi, len, st, 0, hi, len, st);
+      }
+      if (t.ruin) continue;
+      ring(X, f, R0 * 1.12, R0 * 1.12, t.h - 0.6, t.h, n, wcol.map((q) => q * 0.85), [0, 1, 1, 0], rot);      // římsa
+      if (t.clock) for (let i = 0; i < 4; i++) {
+        const a = i * Math.PI / 2, cx = Math.cos(a) * (T + 0.03), cy = Math.sin(a) * (T + 0.03);
+        const ff = frameAt(t.x + Math.cos(t.a) * cx - Math.sin(t.a) * cy, t.y + Math.sin(t.a) * cx + Math.cos(t.a) * cy, 0, t.a + a + Math.PI / 2);
+        const cw = Math.min(1.1, T * 0.55);
+        pushBox(X, ff, -cw, cw, -0.03, 0.03, t.h - 2.2 - cw * 2, t.h - 2.2, [0.95, 0.93, 0.85], [0.6, 1, 0, 0]);
+      }
+      const H = t.to - t.h;
+      if (t.top === 'spire') {
+        ring(R, f, R0 * 1.05, 0, t.h, t.to, t.round ? 8 : 4, tc, [0, 0, 0, 0], rot);
+        for (const k of [0, 1, 2, 3]) if (!t.round && T > 2) {          // nárožní fiály
+          const a = rot + k * Math.PI / 2, cx = Math.cos(a) * R0 * 0.9, cy = Math.sin(a) * R0 * 0.9;
+          ring(R, (s_, u_, z) => f(cx + s_, cy + u_, z), 0.45, 0, t.h, t.h + H * 0.18, 4, tc, [0, 0, 0, 0], Math.PI / 4);
+        }
+      } else if (t.top === 'helm') {       // barokní báně: střecha – lucerna – cibule – špice
+        ring(R, f, R0 * 1.05, R0 * 0.55, t.h, t.h + H * 0.22, 8, tc, [0, 0, 0, 0]);
+        ring(X, f, R0 * 0.42, R0 * 0.42, t.h + H * 0.22, t.h + H * 0.42, 8, wcol, [0, 1, 0, 0]);
+        ring(R, f, R0 * 0.42, R0 * 0.62, t.h + H * 0.42, t.h + H * 0.5, 8, tc, [0, 0, 0, 0]);
+        ring(R, f, R0 * 0.62, R0 * 0.22, t.h + H * 0.5, t.h + H * 0.68, 8, tc, [0, 0, 0, 0]);
+        ring(R, f, R0 * 0.22, 0, t.h + H * 0.68, t.h + H * 0.9, 8, tc, [0, 0, 0, 0]);
+      } else if (t.top === 'tiered') {     // novorenesanční věž radnice: patra s ochozy, štíhlá měděná jehla
+        const tiers = [[1.05, 0.80, 0.00, 0.16], [0.80, 0.80, 0.16, 0.30], [0.86, 0.62, 0.30, 0.40], [0.62, 0.62, 0.40, 0.52], [0.66, 0.40, 0.52, 0.62], [0.40, 0.0, 0.62, 1.0]];
+        tiers.forEach(([r0, r1, h0, h1], k) => ring(k % 2 ? X : R, f, R0 * r0, R0 * r1, t.h + H * h0, t.h + H * h1, 8, k % 2 ? tc.map((q) => q * 0.8) : tc, k % 2 ? [0, 1, 0, 0] : [0, 0, 0, 0]));
+        if (!t.round && T > 2) for (const k of [0, 1, 2, 3]) {          // nárožní věžičky
+          const a = rot + k * Math.PI / 2, cx = Math.cos(a) * R0 * 0.95, cy = Math.sin(a) * R0 * 0.95;
+          ring(R, (s_, u_, z) => f(cx + s_, cy + u_, z), 0.5, 0, t.h, t.h + H * 0.22, 6, tc, [0, 0, 0, 0]);
+        }
+      } else if (t.top === 'dome') {
+        for (let k = 0; k < 5; k++) {
+          const a0 = k / 5 * Math.PI / 2, a1 = (k + 1) / 5 * Math.PI / 2;
+          ring(R, f, R0 * 1.02 * Math.cos(a0), k === 4 ? 0 : R0 * 1.02 * Math.cos(a1), t.h + H * 0.8 * Math.sin(a0), t.h + H * 0.8 * Math.sin(a1), 10, tc, [0, 0, 0, 0]);
+        }
+      } else if (t.top === 'pyramid' || t.top === 'cone') {
+        ring(R, f, R0 * 1.12, 0, t.h, t.to, t.top === 'cone' ? 10 : (t.round ? 10 : 4), tc, [0, 0, 0, 0], rot);
+      } else if (t.top === 'none') {
+        for (let k = 0; k < (t.round ? 10 : 8); k += 2) {                 // cimbuří
+          const a = k / (t.round ? 10 : 8) * Math.PI * 2;
+          pushBox(X, frameAt(t.x + Math.cos(a) * T * 0.85, t.y + Math.sin(a) * T * 0.85, 0, a), -0.5, 0.5, -0.4, 0.4, t.h, t.h + 1.0, wcol, [0, 1, 1, 0]);
+        }
+      }
+      if (t.top !== 'none') pushBox(X, f, -0.07, 0.07, -0.07, 0.07, t.to, t.to + Math.max(1.2, H * 0.06), GOLDC, [0, 1, 0, 0]);
+    }
+    if (b.stk) {                                                        // velký komín nebo chladicí věž
+      const s = b.stk, f = frameAt(s.x, s.y, 0, 0), c = C255(s.wc), aw = [0, 1, 1, 0], z0 = b.b, H = b.e - b.g, DARK = [0.10, 0.10, 0.11];
+      if (s.k === 'v') {                                                // hyperboloid: pata, pas, koruna
+        const P = [[0, 1], [0.14, 0.82], [0.72, 0.60], [1, 0.68]];
+        for (let i = 0; i < 3; i++) ring(X, f, s.r * P[i][1], s.r * P[i + 1][1], i ? b.g + P[i][0] * H : z0, b.g + P[i + 1][0] * H, 16, c, aw);
+        ring(X, f, s.r * 0.68, 0.001, b.e, b.e - 2, 16, DARK, aw);
+      } else if (s.k === 'm') {                                         // vysílač: příhradový dřík, plošiny s anténami
+        ring(X, f, s.r, s.r * 0.22, z0, b.e, 4, c, aw, Math.PI / 4);
+        for (const t of [0.62, 0.8, 0.95]) ring(X, f, s.r * (1 - 0.78 * t) + 0.9, s.r * (1 - 0.78 * t) + 0.9, b.g + t * H - 0.7, b.g + t * H, 8, c.map((q) => q * 0.8), aw);
+      } else if (s.k === 'r') {                                         // dřevěná rozhledna: čtyři nohy, plošiny, stříška
+        const Rr = (t) => s.r * (1 - 0.45 * t), W2 = 0.2;
+        for (const [a, q] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) for (let i = 0; i < 6; i++) { const t0 = i / 6, r0 = Rr(t0) * 0.72; pushBox(X, f, a * r0 - W2, a * r0 + W2, q * r0 - W2, q * r0 + W2, b.g + t0 * H, b.g + (t0 + 1 / 6) * H, c, aw); }
+        for (const t of [0.34, 0.6, 0.84]) ring(X, f, Rr(t) * 1.02, Rr(t) * 1.02, b.g + t * H - 0.25, b.g + t * H + 0.75, 4, c.map((q) => q * 0.82), aw, Math.PI / 4);
+        ring(X, f, Rr(1) * 1.45, 0.001, b.e, b.e + 1.3, 4, [0.27, 0.19, 0.14], aw, Math.PI / 4);
+      } else if (s.k === 't') {                                         // nádrž: válec s mírnou střechou
+        ring(X, f, s.r, s.r, z0, b.e, 16, c, aw);
+        ring(X, f, s.r, 0.001, b.e, b.e + s.r * 0.12, 16, c.map((q) => q * 0.86), aw);
+      } else {
+        const R = (t) => s.r * (1 - 0.52 * t), RED = [0.72, 0.20, 0.15], WHITE = [0.90, 0.88, 0.83], RUST = [0.40, 0.24, 0.17];
+        const seg = (t0, t1, col) => ring(X, f, R(t0), R(t1), t0 ? b.g + t0 * H : z0, b.g + t1 * H, 12, col, aw);
+        if (s.pr) {                                                     // spodek holý beton, nahoře střídavé pruhy
+          seg(0, 0.5, c);
+          for (let i = 0; i < 6; i++) seg(0.5 + i * 0.07, 0.5 + (i + 1) * 0.07, i % 2 ? WHITE : RED);
+          seg(0.92, 1, RUST);
+        } else { seg(0, 0.96, c); seg(0.96, 1, RUST); }
+        const g0 = b.g + 0.92 * H;                                      // ochoz
+        ring(X, f, R(0.92) * 1.35, R(0.92) * 1.35, g0 - 0.5, g0, 12, [0.20, 0.20, 0.22], aw);
+        ring(X, f, R(1), 0.001, b.e, b.e - 2, 12, DARK, aw);
+      }
+    }
+    for (const [x, y, z0, z1, r, col] of b.chs || []) {                 // komíny
+      const f = frameAt(x, y, 0, 0), c = C255(col);
+      ring(X, f, r * 1.25, r, z0, z1, 10, c, [0, 1, 1, 0]);
+      ring(X, f, r * 1.08, r * 1.08, z1 - 1.0, z1, 10, c.map((q) => q * 0.75), [0, 1, 1, 0]);
+    }
+    for (const [cx, cy, ang, L, Wd, top, rc] of b.blk || []) {        // nástavba (jeviště divadla)
+      const f = frameAt(cx, cy, 0, ang), c = C255(rc);
+      pushBox(W, f, -L / 2, L / 2, -Wd / 2, Wd / 2, b.e - 0.5, top, C255(b.wc), [0, 0, 0, 0]);
+      const rh = Math.min(Wd / 2 * 0.9, 5), hl = L / 2 + 0.3, hw = Wd / 2 + 0.3;
+      pushQuad(R, f(-hl, -hw, top), f(hl, -hw, top), f(hl - hw, 0, top + rh), f(-hl + hw, 0, top + rh), c, [0, 0, 0, 0]);
+      pushQuad(R, f(hl, hw, top), f(-hl, hw, top), f(-hl + hw, 0, top + rh), f(hl - hw, 0, top + rh), c, [0, 0, 0, 0]);
+      pushTri(R, f(-hl, hw, top), f(-hl, -hw, top), f(-hl + hw, 0, top + rh), c, [0, 0, 0, 0]);
+      pushTri(R, f(hl, -hw, top), f(hl, hw, top), f(hl - hw, 0, top + rh), c, [0, 0, 0, 0]);
+    }
+    if (b.cn) {                                                          // přesah střechy: jen obvodový pás, střecha zůstane vidět
+      const ring_ = b.p, n_ = ring_.length;
+      const cx = ring_.reduce((a, q) => a + q[0], 0) / n_, cy = ring_.reduce((a, q) => a + q[1], 0) / n_;
+      const out = ring_.map(([x, y]) => { const dx = x - cx, dy = y - cy, l = Math.hypot(dx, dy) || 1; return [x + dx / l * b.cn, y + dy / l * b.cn]; });
+      const z = b.e + 0.6, col = C255(b.rc).map((q) => q * 0.92);
+      for (let i = 0; i < n_; i++) {
+        const j = (i + 1) % n_;
+        pushQuad(X, tv(...ring_[i], z), tv(...ring_[j], z), tv(...out[j], z), tv(...out[i], z), col, [0, 1, 0, 0]);
+        pushQuad(X, tv(...out[i], z - 0.5), tv(...out[j], z - 0.5), tv(...out[j], z), tv(...out[i], z), col.map((q) => q * 0.8), [0, 1, 0, 0]);
+      }
+    }
+  }
+  world.add(new THREE.Mesh(geom(W), wallMat));
+  world.add(new THREE.Mesh(geom(R), roofMat));
+  world.add(new THREE.Mesh(geom(X), solidMat));
+}
+
+// ---------- mobiliář, auta, ploty ----------
+{
+  const P = scene.props;
+  const make = (fn) => { const B = newBuf(); fn(B, (s, t, y) => tv(s, t, y)); return geom(B); };
+  const inst = (g, items, place, colorFn) => {
+    if (!items.length) return;
+    const m = new THREE.InstancedMesh(g, solidMat, items.length);
+    const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), col = new THREE.Color();
+    items.forEach((it, i) => {
+      const [x, y, z, ang] = place(it);
+      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), ang);
+      m4.compose(new THREE.Vector3(x, z, -y), q, new THREE.Vector3(1, 1, 1));
+      m.setMatrixAt(i, m4);
+      if (colorFn) m.setColorAt(i, col.setRGB(...colorFn(it, i)));
+    });
+    m.frustumCulled = false; world.add(m);
+  };
+  const F = (s, t, y) => tv(s, t, y);
+  const lampG = make((B) => {
+    // nenápadná lampa: tenký nízký sloupek, malé světlo (v noci svítí)
+    pushBox(B, F, -0.05, 0.05, -0.05, 0.05, -0.3, 4.6, [0.36, 0.38, 0.40], [0, 1, 0, 0]);
+    pushBox(B, F, -0.14, 0.14, -0.14, 0.14, 4.5, 4.75, [0.90, 0.86, 0.70], [1.2, 1, 0, 0], [0.36, 0.38, 0.40]);
+  });
+  const benchG = make((B) => {
+    pushBox(B, F, -0.8, 0.8, -0.22, 0.22, 0.38, 0.46, [0.58, 0.40, 0.24], [0, 1, 1, 0]);
+    pushBox(B, F, -0.8, 0.8, 0.2, 0.26, 0.46, 0.9, [0.58, 0.40, 0.24], [0, 1, 1, 0]);
+    pushBox(B, F, -0.7, -0.62, -0.2, 0.2, 0, 0.38, [0.25, 0.25, 0.27], [0, 1, 0, 0]);
+    pushBox(B, F, 0.62, 0.7, -0.2, 0.2, 0, 0.38, [0.25, 0.25, 0.27], [0, 1, 0, 0]);
+  });
+  const binG = make((B) => pushBox(B, F, -0.25, 0.25, -0.25, 0.25, 0, 0.95, [0.22, 0.36, 0.26], [0, 1, 1, 0]));
+  const recG = make((B) => {
+    const cols = [[0.92, 0.78, 0.18], [0.20, 0.42, 0.78], [0.22, 0.58, 0.30], [0.90, 0.90, 0.88]];
+    cols.forEach((c, i) => pushBox(B, F, -2.4 + i * 1.25, -1.35 + i * 1.25, -0.6, 0.6, 0, 1.45, c, [0, 1, 1, 0]));
+  });
+  const shelterG = make((B) => {
+    pushBox(B, F, -1.7, 1.7, -0.8, 0.8, 2.35, 2.5, [0.36, 0.40, 0.44], [0, 1, 1, 0]);
+    pushBox(B, F, -1.6, 1.6, 0.7, 0.76, 0.1, 2.35, [0.62, 0.76, 0.84], [0.45, 1, 0, 0]);
+    pushBox(B, F, -1.7, -1.6, -0.8, 0.8, 0, 2.35, [0.36, 0.40, 0.44], [0, 1, 0, 0]);
+    pushBox(B, F, 1.6, 1.7, -0.8, 0.8, 0, 2.35, [0.36, 0.40, 0.44], [0, 1, 0, 0]);
+    pushBox(B, F, -1.4, 1.0, 0.3, 0.6, 0.45, 0.55, [0.58, 0.40, 0.24], [0, 1, 0, 0]);
+  });
+  const towerG = make((B) => {
+    for (let k = 0; k < 6; k++) {
+      const w0 = 2.6 - k * 0.38, w1 = 2.6 - (k + 1) * 0.38;
+      pushBox(B, F, -w0 / 2, w0 / 2, -w0 / 2, w0 / 2, k * 5, k * 5 + 0.4, [0.55, 0.56, 0.58], [0, 1, 0, 0]);
+      for (const [s, t] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) pushBox(B, F, s * w0 / 2 - 0.12, s * w0 / 2 + 0.12, t * w0 / 2 - 0.12, t * w0 / 2 + 0.12, k * 5, k * 5 + 5, [0.55, 0.56, 0.58], [0, 1, 0, 0]);
+    }
+    pushBox(B, F, -7, 7, -0.3, 0.3, 26, 26.6, [0.55, 0.56, 0.58], [0, 1, 0, 0]);
+  });
+  const id = (it) => it;
+  inst(lampG, P.lamp, id);
+  inst(benchG, P.bench, id);
+  inst(binG, P.bin, id);
+  inst(recG, P.recycling, id);
+  inst(shelterG, P.shelter, ([x, y, z, a]) => [x + Math.cos(a - Math.PI / 2) * 0.5, y + Math.sin(a - Math.PI / 2) * 0.5, z, a]);
+  // hroby: náhrobek + obruba
+  const graveG = make((B) => {
+    pushBox(B, F, -0.35, 0.35, -0.08, 0.08, 0, 1, [1, 1, 1], [0, 0, 1, 0]);
+    pushBox(B, F, -0.45, 0.45, -1.85, 0.0, 0, 0.18, [0.62, 0.61, 0.58], [0, 1, 1, 0]);
+  });
+  const STONE = [[0.30, 0.31, 0.33], [0.62, 0.62, 0.60], [0.16, 0.16, 0.18], [0.52, 0.47, 0.42], [0.88, 0.88, 0.85]];
+  if (P.grave && P.grave.length) {
+    const m = new THREE.InstancedMesh(graveG, solidMat, P.grave.length);
+    const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), col = new THREE.Color();
+    P.grave.forEach(([x, y, z, a, h, ci], i) => {
+      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), a);
+      m4.compose(new THREE.Vector3(x, z, -y), q, new THREE.Vector3(1, h, 1));
+      m.setMatrixAt(i, m4); m.setColorAt(i, col.setRGB(...STONE[ci]));
+    });
+    m.frustumCulled = false; world.add(m);
+  }
+  // sochy na hřbitově: podstavec + figura
+  const statueG = make((B) => {
+    pushBox(B, F, -0.6, 0.6, -0.6, 0.6, -0.2, 1.3, [0.58, 0.57, 0.54], [0, 1, 1, 0]);
+    pushBox(B, F, -0.25, 0.25, -0.2, 0.2, 1.3, 2.7, [0.46, 0.47, 0.45], [0, 1, 1, 0]);
+    pushBox(B, F, -0.17, 0.17, -0.15, 0.15, 2.7, 3.05, [0.46, 0.47, 0.45], [0, 1, 1, 0]);
+  });
+  inst(statueG, P.statue || [], id);
+  // popelnice před domy (černá komunál, modrá papír, žlutá plast)
+  const wheelG = make((B) => {
+    pushBox(B, F, -0.3, 0.3, -0.35, 0.35, 0, 1.0, [1, 1, 1], [0, 0, 1, 0]);
+    pushBox(B, F, -0.32, 0.32, -0.38, 0.38, 1.0, 1.08, [1, 1, 1], [0, 0, 1, 0]);
+  });
+  const BINC = [[0.20, 0.21, 0.22], [0.22, 0.38, 0.68], [0.86, 0.72, 0.16], [0.30, 0.48, 0.30]];
+  inst(wheelG, P.wheelie || [], id, (it) => BINC[it[4]]);
+  // pietní plocha na hřbitově: květináče se živým plotem a hrobové desky
+  inst(make((B) => { pushBox(B, F, -1.4, 1.4, -1.4, 1.4, 0, 0.45, [0.70, 0.69, 0.66], [0, 1, 1, 0]); pushBox(B, F, -1.25, 1.25, -1.25, 1.25, 0.45, 1.1, [0.24, 0.40, 0.24], [0, 1, 1, 0]); }), P.planter || [], id);
+  inst(make((B) => pushBox(B, F, -0.9, 0.9, -1.2, 1.2, 0, 0.18, [0.22, 0.22, 0.24], [0, 1, 1, 0])), P.slab || [], id);
+  // altánek / hrobka s měděnou střechou a kůlna u horní brány
+  inst(make((B) => {
+    pushBox(B, F, -2.0, 2.0, -2.0, 2.0, -0.3, 3.2, [0.86, 0.84, 0.78], [0, 1, 0, 0]);
+    for (const [s0, t0, s1, t1] of [[-1, -1, 1, -1], [1, -1, 1, 1], [1, 1, -1, 1], [-1, 1, -1, -1]])
+      pushTri(B, F(s0 * 2.4, t0 * 2.4, 3.2), F(s1 * 2.4, t1 * 2.4, 3.2), F(0, 0, 5.6), [0.36, 0.62, 0.56], [0, 1, 1, 0]);
+    pushBox(B, F, -0.06, 0.06, -0.06, 0.06, 5.6, 6.6, [0.80, 0.70, 0.32], [0, 1, 0, 0]);
+  }), P.pavilion || [], id);
+  inst(make((B) => {
+    pushBox(B, F, -2.4, 2.4, -1.8, 1.8, -0.3, 2.4, [0.80, 0.76, 0.68], [0, 1, 0, 0]);
+    pushQuad(B, F(-2.6, -2.0, 2.4), F(2.6, -2.0, 2.4), F(2.6, 0, 3.6), F(-2.6, 0, 3.6), [0.66, 0.26, 0.20], [0, 1, 1, 0]);
+    pushQuad(B, F(2.6, 2.0, 2.4), F(-2.6, 2.0, 2.4), F(-2.6, 0, 3.6), F(2.6, 0, 3.6), [0.66, 0.26, 0.20], [0, 1, 1, 0]);
+    pushTri(B, F(-2.4, -1.8, 2.4), F(-2.4, 1.8, 2.4), F(-2.4, 0, 3.6), [0.80, 0.76, 0.68], [0, 1, 0, 0]);
+    pushTri(B, F(2.4, 1.8, 2.4), F(2.4, -1.8, 2.4), F(2.4, 0, 3.6), [0.80, 0.76, 0.68], [0, 1, 0, 0]);
+  }), P.shed || [], id);
+  const carG = make((B) => {
+    pushBox(B, F, -2.1, 2.1, -0.88, 0.88, 0.3, 1.0, [1, 1, 1], [0, 0, 0, 0]);
+    pushBox(B, F, -1.2, 1.0, -0.8, 0.8, 1.0, 1.45, [0.28, 0.34, 0.42], [0, 1, 0, 0]);
+    pushBox(B, F, -1.15, 0.95, -0.78, 0.78, 1.45, 1.52, [1, 1, 1], [0, 0, 1, 0]);
+    for (const s of [-1.35, 1.35]) for (const t of [-0.82, 0.82]) pushBox(B, F, s - 0.32, s + 0.32, t - 0.1, t + 0.1, 0, 0.62, [0.12, 0.12, 0.13], [0, 1, 0, 0]);
+  });
+  const CAR = [[0.92, 0.92, 0.90], [0.70, 0.72, 0.75], [0.16, 0.17, 0.19], [0.72, 0.16, 0.14], [0.20, 0.32, 0.62], [0.38, 0.40, 0.43], [0.24, 0.42, 0.30], [0.80, 0.74, 0.60]];
+  inst(carG, scene.cars, ([x, y, z, a]) => [x, y, z, a], (it) => CAR[it[4]]);
+
+  // ploty, živé ploty, zdi, vedení
+  const L = newBuf();
+  const hedgeCol = SEASON_ID === 3 ? [0.20, 0.30, 0.20] : SEASON_ID === 2 ? [0.36, 0.42, 0.20] : [0.24, 0.44, 0.22];
+  for (const [kind, h, col, w] of [['fence', 1.25, [0.40, 0.38, 0.35], 0.06], ['hedge', 1.6, hedgeCol, 0.9], ['wall', 1.2, [0.62, 0.60, 0.56], 0.35]]) {
+    for (const pl of scene.lines[kind]) for (let i = 0; i < pl.length - 1; i++) {
+      const [x0, y0, z0] = pl[i], [x1, y1, z1] = pl[i + 1];
+      const len = Math.hypot(x1 - x0, y1 - y0); if (len < 0.1) continue;
+      const nx = -(y1 - y0) / len * w / 2, ny = (x1 - x0) / len * w / 2;
+      const aw = [0, 1, 1, 0];
+      const A = (x, y, z) => tv(x, y, z);
+      pushQuad(L, A(x0 + nx, y0 + ny, z0 - 0.3), A(x1 + nx, y1 + ny, z1 - 0.3), A(x1 + nx, y1 + ny, z1 + h), A(x0 + nx, y0 + ny, z0 + h), col, aw);
+      pushQuad(L, A(x1 - nx, y1 - ny, z1 - 0.3), A(x0 - nx, y0 - ny, z0 - 0.3), A(x0 - nx, y0 - ny, z0 + h), A(x1 - nx, y1 - ny, z1 + h), col, aw);
+      pushQuad(L, A(x0 + nx, y0 + ny, z0 + h), A(x1 + nx, y1 + ny, z1 + h), A(x1 - nx, y1 - ny, z1 + h), A(x0 - nx, y0 - ny, z0 + h), col.map((v) => v * 1.1), aw);
+      if (kind === 'fence') for (let d = 0; d < len; d += 2.5) {
+        const t = d / len, x = x0 + (x1 - x0) * t, y = y0 + (y1 - y0) * t, z = z0 + (z1 - z0) * t;
+        pushBox(L, frameAt(x, y, z, 0), -0.07, 0.07, -0.07, 0.07, -0.3, h + 0.15, [0.30, 0.28, 0.26], [0, 1, 0, 0]);
+      }
+    }
+  }
+  // nadzemní potrubí (nastroje/kominy.py): rezavá trubka na sloupcích
+  for (const pl of (scene.lines.pipe || [])) for (let i = 0; i < pl.length - 1; i++) {
+    const [x0, y0, z0] = pl[i], [x1, y1, z1] = pl[i + 1], len = Math.hypot(x1 - x0, y1 - y0); if (len < 0.1) continue;
+    const nx = -(y1 - y0) / len * 0.45, ny = (x1 - x0) / len * 0.45, col = [0.47, 0.27, 0.19], aw = [0, 1, 1, 0], H0 = 4.6, H1 = 5.5;
+    const A = (x, y, z) => tv(x, y, z);
+    pushQuad(L, A(x0 + nx, y0 + ny, z0 + H0), A(x1 + nx, y1 + ny, z1 + H0), A(x1 + nx, y1 + ny, z1 + H1), A(x0 + nx, y0 + ny, z0 + H1), col, aw);
+    pushQuad(L, A(x1 - nx, y1 - ny, z1 + H0), A(x0 - nx, y0 - ny, z0 + H0), A(x0 - nx, y0 - ny, z0 + H1), A(x1 - nx, y1 - ny, z1 + H1), col, aw);
+    pushQuad(L, A(x0 + nx, y0 + ny, z0 + H1), A(x1 + nx, y1 + ny, z1 + H1), A(x1 - nx, y1 - ny, z1 + H1), A(x0 - nx, y0 - ny, z0 + H1), col.map((v) => v * 1.15), aw);
+    for (let d = 0; d < len; d += 9) { const t = d / len; pushBox(L, frameAt(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, z0 + (z1 - z0) * t, 0), -0.15, 0.15, -0.15, 0.15, -0.3, H0, [0.33, 0.24, 0.20], [0, 1, 0, 0]); }
+  }
+  // mosty a lávky (prep: scene.bridges, body [x, y, mostovka, terén]): souvislý pás (společné rohy na spojích, vyhlazená výška),
+  // nad terénem most s boky, zábradlím a pilíři, nízko nad terénem zemní násyp
+  // půdorysy úseků všech mostovek (kvůli souběžným mostovkám: kde se dotýkají, vnitřní zábradlí a boky se nekreslí)
+  const DQ = [];
+  (scene.bridges || []).forEach((br, bi) => {
+    const P = br.p, hw = br.w / 2;
+    for (let i = 0; i < P.length - 1; i++) {
+      const [x0, y0, z0] = P[i], [x1, y1, z1] = P[i + 1], l = Math.hypot(x1 - x0, y1 - y0); if (l < 0.05) continue;
+      const nx = -(y1 - y0) / l * hw, ny = (x1 - x0) / l * hw;
+      DQ.push({ bi, z: (z0 + z1) / 2, q: [[x0 + nx, y0 + ny], [x1 + nx, y1 + ny], [x1 - nx, y1 - ny], [x0 - nx, y0 - ny]],
+        bb: [Math.min(x0, x1) - hw, Math.min(y0, y1) - hw, Math.max(x0, x1) + hw, Math.max(y0, y1) + hw] });
+    }
+  });
+  const covered = (bi, x, y, z) => DQ.some((d) => d.bi !== bi && x >= d.bb[0] && x <= d.bb[2] && y >= d.bb[1] && y <= d.bb[3] && Math.abs(d.z - z) < 1.5 && pointInPoly(x, y, d.q));
+  (scene.bridges || []).forEach((br, bi) => {
+    const hw = br.w / 2, foot = br.k === 'foot', rail = br.k === 'rail';
+    const th = foot ? 0.45 : 1.1, W = [0, 1, 1, 0];
+    const top = rail ? [0.46, 0.43, 0.39] : foot ? (SEASON_ID === 3 ? [0.86, 0.88, 0.92] : [0.62, 0.56, 0.47]) : [0.38, 0.39, 0.42];
+    const side = foot ? [0.52, 0.47, 0.40] : [0.70, 0.69, 0.66], rcol = foot ? [0.24, 0.25, 0.27] : [0.78, 0.77, 0.74];
+    const EMB = 2.5, grass = [[122, 176, 80], [106, 160, 74], [122, 154, 72], [228, 232, 238]][SEASON_ID].map((v) => v / 255);
+    const A = (x, y, z) => tv(x, y, z);
+    // body bez duplicit, výška vyhlazená (konce zůstávají na terénu), aby se sklon nelámal každé 4 m
+    const P = [];
+    for (const q of br.p) if (!P.length || Math.hypot(q[0] - P[P.length - 1][0], q[1] - P[P.length - 1][1]) > 0.3) P.push([...q]);
+    if (P.length < 2) return;
+    for (let it = 0; it < 3; it++) { const z = P.map((q) => q[2]); for (let i = 1; i < P.length - 1; i++) P[i][2] = Math.max(0.25 * z[i - 1] + 0.5 * z[i] + 0.25 * z[i + 1], P[i][3] + 0.15); }
+    // směry úseků a kolmice v bodech (pokos: na ohybu se sousední úseky potkají ve stejném rohu, bez mezer a překryvů)
+    const U = [], M = [];
+    for (let i = 0; i < P.length - 1; i++) { const dx = P[i + 1][0] - P[i][0], dy = P[i + 1][1] - P[i][1], l = Math.hypot(dx, dy); U.push([dx / l, dy / l, l]); }
+    for (let i = 0; i < P.length; i++) {
+      const a_ = U[Math.max(0, i - 1)], b_ = U[Math.min(U.length - 1, i)];
+      let mx = -a_[1] - b_[1], my = a_[0] + b_[0]; const ml = Math.hypot(mx, my) || 1; mx /= ml; my /= ml;
+      const k = 1 / Math.max(0.6, mx * -b_[1] + my * b_[0]); M.push([mx * k, my * k]);
+    }
+    const slope = (ax, ay, az, ag, bx, by, bz, bg, oa, ob) => {      // svah od hrany (a -> b) ven ve směrech oa / ob na terén
+      const fa = 0.5 * Math.max(az - ag, 0) + 0.2, fb = 0.5 * Math.max(bz - bg, 0) + 0.2;      // strmý svah, ať nepřetéká na vedlejší silnici
+      const A2 = [ax + oa[0] * fa, ay + oa[1] * fa, ag - 0.25], B2 = [bx + ob[0] * fb, by + ob[1] * fb, bg - 0.25];
+      pushQuad(L, A(ax, ay, az), A(bx, by, bz), A(...B2), A(...A2), grass, W);
+      pushQuad(L, A(ax, ay, az), A(...A2), A(...B2), A(bx, by, bz), grass, W);
+    };
+    for (const [i, sg] of [[0, -1], [P.length - 1, 1]]) {                                                                                // konec nad terénem: čelní svah
+      const [ex_, ey_, ez, eg] = P[i], u = U[sg < 0 ? 0 : U.length - 1], m = M[i];
+      if (ez - eg > 0.3) slope(ex_ + m[0] * hw, ey_ + m[1] * hw, ez, eg, ex_ - m[0] * hw, ey_ - m[1] * hw, ez, eg, [u[0] * sg, u[1] * sg], [u[0] * sg, u[1] * sg]);
+    }
+    let run = 0, nextPier = 18;
+    for (let i = 0; i < P.length - 1; i++) {
+      const [x0, y0, z0, g0] = P[i], [x1, y1, z1, g1] = P[i + 1], [ux, uy, len] = U[i];
+      const n0 = [M[i][0] * hw, M[i][1] * hw], n1 = [M[i + 1][0] * hw, M[i + 1][1] * hw];
+      pushQuad(L, A(x0 + n0[0], y0 + n0[1], z0), A(x0 - n0[0], y0 - n0[1], z0), A(x1 - n1[0], y1 - n1[1], z1), A(x1 + n1[0], y1 + n1[1], z1), top, W);   // mostovka
+      if (!foot && !rail && br.w >= 6) for (let d = 1; d < len - 1; d += 9) {                                                           // středová čára
+        const t0 = d / len, t1 = Math.min(1, (d + 3) / len), q = 0.12;
+        const ax = x0 + (x1 - x0) * t0, ay = y0 + (y1 - y0) * t0, az = z0 + (z1 - z0) * t0 + 0.03, bx = x0 + (x1 - x0) * t1, by = y0 + (y1 - y0) * t1, bz = z0 + (z1 - z0) * t1 + 0.03;
+        pushQuad(L, A(ax - uy * q, ay + ux * q, az), A(ax + uy * q, ay - ux * q, az), A(bx + uy * q, by - ux * q, bz), A(bx - uy * q, by + ux * q, bz), [0.92, 0.92, 0.88], [0, 0, 0, 0]);
+      }
+      if (rail) for (const o of [-0.75, 0.75]) {
+        const k0 = o / hw, k1 = o / hw;
+        pushQuad(L, A(x0 + n0[0] * k0 - uy * 0.07, y0 + n0[1] * k0 + ux * 0.07, z0 + 0.12), A(x0 + n0[0] * k0 + uy * 0.07, y0 + n0[1] * k0 - ux * 0.07, z0 + 0.12),
+          A(x1 + n1[0] * k1 + uy * 0.07, y1 + n1[1] * k1 - ux * 0.07, z1 + 0.12), A(x1 + n1[0] * k1 - uy * 0.07, y1 + n1[1] * k1 + ux * 0.07, z1 + 0.12), [0.30, 0.29, 0.28], [0, 0, 0, 0]);
+      }
+      const ext = [1, -1].map((sg) => !covered(bi, (x0 + x1) / 2 + (n0[0] + n1[0]) / 2 * sg * (1 + 0.5 / hw), (y0 + y1) / 2 + (n0[1] + n1[1]) / 2 * sg * (1 + 0.5 / hw), (z0 + z1) / 2));   // volná hrana?
+      if (Math.max(z0 - g0, z1 - g1) < EMB) {                                                                                             // násyp
+        for (const sg of [1, -1]) if (ext[sg > 0 ? 0 : 1]) slope(x0 + n0[0] * sg, y0 + n0[1] * sg, z0, g0, x1 + n1[0] * sg, y1 + n1[1] * sg, z1, g1, [M[i][0] * sg, M[i][1] * sg], [M[i + 1][0] * sg, M[i + 1][1] * sg]);
+        run += len; while (run >= nextPier) nextPier += foot ? 15 : 22;
+        continue;
+      }
+      if (ext[0]) pushQuad(L, A(x0 + n0[0], y0 + n0[1], z0 - th), A(x0 + n0[0], y0 + n0[1], z0), A(x1 + n1[0], y1 + n1[1], z1), A(x1 + n1[0], y1 + n1[1], z1 - th), side, W);  // boky
+      if (ext[1]) pushQuad(L, A(x1 - n1[0], y1 - n1[1], z1 - th), A(x1 - n1[0], y1 - n1[1], z1), A(x0 - n0[0], y0 - n0[1], z0), A(x0 - n0[0], y0 - n0[1], z0 - th), side, W);
+      for (const sg of [1, -1]) {
+        if (!ext[sg > 0 ? 0 : 1]) continue;                                                                                                            // zábradlí
+        const e0 = [n0[0] * sg, n0[1] * sg], e1 = [n1[0] * sg, n1[1] * sg], tk = (foot ? 0.06 : 0.3) / hw;
+        const i0 = [-e0[0] * tk, -e0[1] * tk], i1 = [-e1[0] * tk, -e1[1] * tk], hR = foot ? 1.05 : 0.95;
+        if (foot) {
+          pushQuad(L, A(x0 + e0[0], y0 + e0[1], z0 + hR - 0.08), A(x1 + e1[0], y1 + e1[1], z1 + hR - 0.08), A(x1 + e1[0], y1 + e1[1], z1 + hR), A(x0 + e0[0], y0 + e0[1], z0 + hR), rcol, W);
+          for (let d = 0; d < len; d += 2) { const t = d / len; pushBox(L, frameAt(x0 + (x1 - x0) * t + (e0[0] + (e1[0] - e0[0]) * t) * 0.97, y0 + (y1 - y0) * t + (e0[1] + (e1[1] - e0[1]) * t) * 0.97, z0 + (z1 - z0) * t, Math.atan2(uy, ux)), -0.04, 0.04, -0.04, 0.04, 0, hR, rcol, [0, 1, 0, 0]); }
+        } else {
+          pushQuad(L, A(x0 + e0[0], y0 + e0[1], z0 - th), A(x1 + e1[0], y1 + e1[1], z1 - th), A(x1 + e1[0], y1 + e1[1], z1 + hR), A(x0 + e0[0], y0 + e0[1], z0 + hR), rcol, W);
+          pushQuad(L, A(x0 + e0[0] + i0[0], y0 + e0[1] + i0[1], z0 + hR), A(x1 + e1[0] + i1[0], y1 + e1[1] + i1[1], z1 + hR), A(x1 + e1[0], y1 + e1[1], z1 + hR), A(x0 + e0[0], y0 + e0[1], z0 + hR), rcol.map((v) => v * 1.08), W);
+          pushQuad(L, A(x1 + e1[0] + i1[0], y1 + e1[1] + i1[1], z1), A(x1 + e1[0] + i1[0], y1 + e1[1] + i1[1], z1 + hR), A(x0 + e0[0] + i0[0], y0 + e0[1] + i0[1], z0 + hR), A(x0 + e0[0] + i0[0], y0 + e0[1] + i0[1], z0), rcol.map((v) => v * 0.9), W);
+        }
+      }
+      run += len;
+      while (run >= nextPier) {                                                                                                         // pilíře po ~22 m, jen kde je pod mostem místo
+        const t = 1 - (run - nextPier) / len, x = x0 + (x1 - x0) * t, y = y0 + (y1 - y0) * t, z = z0 + (z1 - z0) * t, g = g0 + (g1 - g0) * t;
+        if (z - g > 2.5 && !(foot && br.w < 4 && run < 30)) pushBox(L, frameAt(x, y, g - 0.5, Math.atan2(uy, ux)), -0.7, 0.7, -hw * 0.75, hw * 0.75, 0, z - th - g + 0.5, side.map((v) => v * 0.92), [0, 1, 0, 0]);
+        nextPier += foot ? 15 : 22;
+      }
+    }
+  });
+  for (const [x, y, z, a] of scene.portals || []) {           // portál tunelu: betonový rám a tma uvnitř, čelem k silnici
+    const f = frameAt(x, y, z, a), W = [0, 1, 0, 0], C = [0.56, 0.55, 0.52];
+    pushBox(L, f, -1.5, 0.2, -6.6, 6.6, -0.5, 5.2, [0.05, 0.05, 0.06], W);
+    pushBox(L, f, -1.6, 0.4, -7.6, -6.4, -0.5, 6.4, C, W);
+    pushBox(L, f, -1.6, 0.4, 6.4, 7.6, -0.5, 6.4, C, W);
+    pushBox(L, f, -1.6, 0.4, -7.6, 7.6, 5.2, 6.4, C, W);
+  }
+  for (const [x, y, z, a, k] of scene.buses || []) {          // stojící autobusy na nádraží
+    const f = frameAt(x, y, z, a), W = [0, 1, 1, 0];
+    pushBox(L, f, -6, 6, -1.25, 1.25, 0.35, 3.0, k ? [0.92, 0.66, 0.16] : [0.90, 0.90, 0.88], W);
+    pushBox(L, f, -5.6, 5.6, -1.28, 1.28, 1.5, 2.5, [0.20, 0.26, 0.32], W);
+    for (const s of [-3.8, 3.8]) pushBox(L, f, s - 0.5, s + 0.5, -1.27, 1.27, 0, 0.7, [0.12, 0.12, 0.13], W);
+  }
+  world.add(new THREE.Mesh(geom(L), solidMat));
+  // lana lanovek a vleků – tenké tmavé čáry (elektrické vedení se nekreslí)
+  const wires = [];
+  for (const pl of scene.lines.lift || []) for (let i = 0; i < pl.length - 1; i++) {          // jen lanovky a vleky
+    const [x0, y0, z0] = pl[i], [x1, y1, z1] = pl[i + 1];
+    wires.push(...tv(x0, y0, z0 + 8), ...tv(x1, y1, z1 + 8));
+  }
+  if (wires.length) {
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(wires, 3));
+    world.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: LIGHTS ? 0x000000 : 0x2a2a2e })));
+  }
+}
+
+// ---------- stromy: pixel-art sprity (billboardy) + neviditelná tělesa pro stíny ----------
+{
+  const T = scene.trees.filter((t) => t[5] !== 2);
+  const CW = 96, CH = 128, COLS = 16, ROWS = 5, PX = 0.2;            // 1 pixel spritu = 0,2 m = 1 pixel mapy
+  const atlas = document.createElement('canvas'); atlas.width = CW * COLS; atlas.height = CH * ROWS;
+  const actx = atlas.getContext('2d');
+  let seed = 4242; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const hx = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  const P = (...hs) => hs.map(hx);
+  const G = {
+    summer: [P('#1b3016', '#2b4f21', '#3c6c2d', '#548b3a', '#76a84d'), P('#1a2f19', '#284a26', '#376534', '#4c8043', '#6b9c55'), P('#203316', '#33561f', '#4a7a2a', '#65983a', '#8ab552')],
+    spring: [P('#24401b', '#386526', '#518a32', '#6eaa42', '#98c862'), P('#22401f', '#355f2c', '#4c823a', '#68a14b', '#8fc066')],
+    blossomW: P('#5d5357', '#a9999f', '#d9ccd1', '#f2e9ed', '#ffffff'),
+    blossomP: P('#643646', '#ab5f76', '#d78ba2', '#efb8c8', '#ffe1ea'),
+    autumn: [P('#2a3214', '#465a1e', '#62782a', '#7f923a', '#a3ae54'), P('#4a3a10', '#8a6a18', '#c49a28', '#e2c045', '#f4dd78'), P('#4a2410', '#8a4418', '#c46a24', '#e2903a', '#f4b860'), P('#3e1610', '#7a2a1a', '#a83e22', '#cc5a30', '#e88050'), P('#3a2c14', '#6a5226', '#92743a', '#b29452', '#d0b070')],
+    conifer: [P('#0e2018', '#173826', '#214e33', '#2d6640', '#3f824d'), P('#10221a', '#1a3c2c', '#24543b', '#316e4a', '#45895a')],
+  };
+  const TRUNK = P('#2e1e14', '#4c3322', '#6a4a30');
+  const SNOWC = P('#9aa6b8', '#d6dde8', '#f4f7fb');
+  const season = SEASON;
+  function cell(slotIdx) { return [(slotIdx % COLS) * CW, Math.floor(slotIdx / COLS) * CH]; }
+  function newBufC() { return { c: new Int16Array(CW * CH).fill(-1), rgb: new Uint8ClampedArray(CW * CH * 4) }; }
+  function setPx(B, x, y, rgb, tag = 1) { x |= 0; y |= 0; if (x < 0 || y < 0 || x >= CW || y >= CH) return; const i = y * CW + x; B.c[i] = tag; B.rgb.set([...rgb, 255], i * 4); }
+  const L3 = (() => { const v = [-0.55, -0.62, 0.56]; const l = Math.hypot(...v); return v.map((q) => q / l); })();
+  function outline(B, col) {
+    const add = [];
+    for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++) {
+      if (B.c[y * CW + x] >= 0) continue;
+      const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dy]) => { const X = x + dx, Y = y + dy; return X >= 0 && Y >= 0 && X < CW && Y < CH && B.c[Y * CW + X] >= 0; });
+      if (nb) add.push([x, y]);
+    }
+    for (const [x, y] of add) setPx(B, x, y, col, 0);
+  }
+  function blobCrown(B, cx, cy, rx, ry, pal, nBlobs, tagBase = 10) {
+    const blobs = [[cx, cy, Math.min(rx, ry) * 0.75]];
+    for (let i = 0; i < nBlobs; i++) {
+      const a = rnd() * Math.PI * 2, d = 0.35 + rnd() * 0.5;
+      blobs.push([cx + Math.cos(a) * rx * d * 0.62, cy + Math.sin(a) * ry * d * 0.55, Math.min(rx, ry) * (0.38 + rnd() * 0.22)]);
+    }
+    const own = new Int16Array(CW * CH).fill(-1);
+    for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++) {
+      let best = -1, bz = -1, nx = 0, ny = 0, nz = 0;
+      blobs.forEach(([bx, by, br], i) => {
+        const dx = (x + 0.5 - bx) / br, dy = (y + 0.5 - by) / br, d2 = dx * dx + dy * dy;
+        if (d2 > 1) return;
+        const dz = Math.sqrt(1 - d2), zz = dz * br - by * 0.02;
+        if (zz > bz) { bz = zz; best = i; nx = dx; ny = dy; nz = dz; }
+      });
+      if (best < 0) continue;
+      own[y * CW + x] = best;
+      let l = nx * L3[0] + ny * L3[1] + nz * L3[2];
+      const hsh = (Math.sin(x * 12.99 + y * 78.23 + seed * 0.001) * 43758.5) % 1;
+      const h = hsh < 0 ? hsh + 1 : hsh;
+      l += (h - 0.5) * 0.22 + (((x + y) & 1) ? 0.04 : -0.04);
+      let t = l > 0.72 ? 4 : l > 0.45 ? 3 : l > 0.15 ? 2 : 1;
+      if (h > 0.93 && t < 4) t++;
+      setPx(B, x, y, pal[t], tagBase + best);
+    }
+    // stín mezi chomáči listí
+    for (let y = 1; y < CH; y++) for (let x = 0; x < CW; x++) {
+      const o = own[y * CW + x], up = own[(y - 1) * CW + x];
+      if (o >= 0 && up >= 0 && o !== up && blobs[o][1] > blobs[up][1]) setPx(B, x, y, pal[1], tagBase + o);
+    }
+  }
+  function trunk(B, cx, y0, y1, w) {
+    for (let y = y0; y < y1; y++) for (let x = Math.round(cx - w / 2); x < Math.round(cx + w / 2); x++) setPx(B, x, y, x < cx ? TRUNK[2] : TRUNK[1], 2);
+  }
+  function deciduous(B, Hpx, Wpx, pal) {
+    const base = CH - 3, cx = CW / 2;
+    trunk(B, cx, Math.round(base - Hpx * 0.45), base, Math.max(2, Math.round(Wpx * 0.09)));
+    blobCrown(B, cx, base - Hpx * 0.62, Wpx / 2, Hpx * 0.36, pal, 6 + Math.floor(rnd() * 4));
+    outline(B, pal[0]);
+  }
+  function bareTree(B, Hpx, Wpx) {
+    const base = CH - 3, cx = CW / 2;
+    const tw = Math.max(2, Math.round(Wpx * 0.08));
+    trunk(B, cx, Math.round(base - Hpx * 0.4), base, tw);
+    const branch = (x, y, a, len, w, depth) => {
+      const steps = Math.max(2, Math.round(len));
+      for (let i = 0; i < steps; i++) {
+        const px = x + Math.cos(a) * i, py = y - Math.sin(a) * i;
+        for (let k = 0; k < Math.max(1, Math.round(w)); k++) setPx(B, px + k, py, depth < 2 ? TRUNK[1] : TRUNK[2], 3);
+        if (depth >= 2 && rnd() < 0.18) setPx(B, px, py - 1, SNOWC[2], 4);       // sníh na větvi
+      }
+      const ex = x + Math.cos(a) * len, ey = y - Math.sin(a) * len;
+      if (depth >= 4) { for (let i = 0; i < 6; i++) setPx(B, ex + (rnd() - 0.5) * 6, ey + (rnd() - 0.5) * 5, rnd() < 0.5 ? TRUNK[1] : TRUNK[0], 3); return; }
+      const n = 2 + (rnd() < 0.4 ? 1 : 0);
+      for (let i = 0; i < n; i++) branch(ex, ey, a + (rnd() - 0.5) * 1.3 + (i - (n - 1) / 2) * 0.55, len * (0.62 + rnd() * 0.15), w * 0.65, depth + 1);
+    };
+    branch(cx, base - Hpx * 0.4, Math.PI / 2, Hpx * 0.22, tw * 0.8, 0);
+    outline(B, [40, 32, 28]);
+  }
+  // zimní listnáč: kmen a hlavní větve, koruna z řídké sítě větviček (dither) a sníh na horních větvích
+  function winterTree(B, Hpx, Wpx) {
+    const base = CH - 3, cx = CW / 2;
+    trunk(B, cx, Math.round(base - Hpx * 0.5), base, Math.max(2, Math.round(Wpx * 0.08)));
+    const TW = P('#2c241f', '#4a3d34', '#66564a', '#857262', '#a08c7a');
+    const C = newBufC();
+    blobCrown(C, cx, base - Hpx * 0.62, Wpx / 2, Hpx * 0.36, TW, 6 + Math.floor(rnd() * 3));
+    for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++) {
+      const i = y * CW + x; if (C.c[i] < 0) continue;
+      const hsh = Math.abs(Math.sin(x * 91.7 + y * 47.3 + seed * 0.01) * 43758.5) % 1;
+      const keep = ((x + y) & 1) === 0 ? hsh < 0.7 : hsh < 0.18;
+      if (!keep) continue;
+      const lit = C.rgb[i * 4] >= TW[3][0] - 2;              // horní osvětlené větvičky
+      const up = y > 0 && C.c[(y - 1) * CW + x] < 0;
+      setPx(B, x, y, (lit && hsh < 0.55) || (up && hsh < 0.8) ? SNOWC[2] : [C.rgb[i * 4], C.rgb[i * 4 + 1], C.rgb[i * 4 + 2]], 11);
+    }
+    // hlavní větve do koruny
+    for (const a of [-0.9, -0.35, 0.3, 0.85]) {
+      const len = Hpx * (0.22 + rnd() * 0.08);
+      for (let k = 0; k < len; k++) setPx(B, cx + Math.sin(a) * k, base - Hpx * 0.45 - Math.cos(a) * k * 0.9, TRUNK[1], 3);
+    }
+  }
+  function conifer(B, Hpx, Wpx, pal, snow) {
+    const base = CH - 3, cx = CW / 2;
+    trunk(B, cx, base - Math.round(Hpx * 0.14), base, Math.max(2, Math.round(Wpx * 0.12)));
+    const tiers = 5 + Math.floor(rnd() * 3), top = base - Hpx, crownH = Hpx * 0.88;
+    for (let i = 0; i < tiers; i++) {
+      const tb = base - Hpx * 0.1 - crownH * (i / tiers) * 0.92, tt = top + (crownH / tiers) * (tiers - i - 1) * 0.15;
+      const wi = Wpx * (1 - i / tiers * 0.82) / 2;
+      for (let y = Math.floor(tt); y <= tb; y++) {
+        const f = (y - tt) / Math.max(1, tb - tt), hw = wi * f + (rnd() < 0.3 ? 1 : 0);
+        for (let x = Math.round(cx - hw); x <= Math.round(cx + hw); x++) {
+          const rel = (x - cx) / Math.max(1, hw);
+          let t = rel < -0.35 ? 3 : rel < 0.25 ? 2 : 1;
+          if (y > tb - 2) t = Math.max(1, t - 1);
+          if ((x * 7 + y * 13) % 11 === 0) t = Math.min(4, t + 1);
+          let c = pal[t];
+          if (snow && (y < tt + 2 + rnd() * 2 || (rel < 0 && y < tt + (tb - tt) * 0.35 && rnd() < 0.5))) c = rel < 0 ? SNOWC[2] : SNOWC[1];
+          setPx(B, x, y, c, 20 + i);
+        }
+      }
+    }
+    outline(B, pal[0]);
+  }
+  function columnar(B, Hpx, Wpx, pal, snow) {
+    const base = CH - 3, cx = CW / 2;
+    trunk(B, cx, base - 3, base, 2);
+    const cy = base - Hpx * 0.52, rx = Wpx / 2, ry = Hpx * 0.5;
+    for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++) {
+      const dx = (x + 0.5 - cx) / rx, dy = (y + 0.5 - cy) / ry, d2 = dx * dx + dy * dy;
+      if (d2 > 1) continue;
+      let l = dx * L3[0] * 1.2 + dy * L3[1] * 0.4 + Math.sqrt(1 - d2) * L3[2];
+      if ((x * 5 + y * 3) % 7 === 0) l -= 0.15;
+      const t = l > 0.62 ? 4 : l > 0.38 ? 3 : l > 0.1 ? 2 : 1;
+      setPx(B, x, y, snow && dy < -0.55 && dx < 0.2 ? SNOWC[2] : pal[t], 30);
+    }
+    outline(B, pal[0]);
+  }
+  // sloty atlasu: [druh][velikost] -> seznam slotů
+  const DEC_H = [8, 13, 19], CON_H = [9, 15, 22], COL_H = [5, 14], BUSH_H = 3;
+  const decPals = season === 'autumn' ? [G.autumn[0], G.autumn[1], G.autumn[2], G.autumn[3], G.autumn[4], G.autumn[0], G.autumn[1], G.autumn[2]]
+    : season === 'spring' ? [G.spring[0], G.spring[1], G.spring[0], G.spring[1], G.spring[0], G.spring[1], G.spring[0], G.spring[1], G.spring[0], G.spring[1], G.spring[0], G.blossomW]
+    : [G.summer[0], G.summer[1], G.summer[2], G.summer[0], G.summer[1], G.summer[2], G.summer[0], G.summer[1]];
+  const winter = season === 'winter';
+  const slots = { dec: [[], [], []], con: [[], [], []], col: [[], []], bush: [] };
+  let slot = 0;
+  const draw = (fn) => { const B = newBufC(); fn(B); const [ox, oy] = cell(slot); actx.putImageData(new ImageData(B.rgb, CW, CH), ox, oy); return slot++; };
+  DEC_H.forEach((H, si) => { for (let v = 0; v < (season === 'spring' ? 12 : 8); v++) slots.dec[si].push(draw((B) => winter ? winterTree(B, H * 0.866 / PX, H * 0.62 / PX) : deciduous(B, H * 0.866 / PX, H * 0.62 / PX, decPals[v % decPals.length]))); });
+  // na jaře kvete jen část stromů (bílá, výjimečně růžová) – víc zelených variant v atlasu
+  if (season === 'spring') slots.dec[1][5] = draw((B) => deciduous(B, DEC_H[1] * 0.866 / PX, DEC_H[1] * 0.62 / PX, G.blossomP));
+  CON_H.forEach((H, si) => { for (let v = 0; v < 4; v++) slots.con[si].push(draw((B) => conifer(B, H * 0.866 / PX, H * 0.42 / PX, G.conifer[v % 2], winter))); });
+  COL_H.forEach((H, si) => { for (let v = 0; v < 3; v++) slots.col[si].push(draw((B) => columnar(B, H * 0.866 / PX, Math.max(5, H * 0.22 / PX), G.conifer[v % 2], winter))); });
+  for (let v = 0; v < 4; v++) slots.bush.push(draw((B) => {
+    const pal = winter ? P('#2e2620', '#4a3e34', '#625244', '#d6dde8', '#f4f7fb') : decPals[v * 2 % decPals.length];
+    blobCrown(B, CW / 2, CH - 3 - BUSH_H * 0.4 / PX, 2.2 / PX, BUSH_H * 0.42 / PX, pal, 4); outline(B, pal[0]);
+  }));
+  window.TREE_EXPORT = () => ({ url: atlas.toDataURL(), slots, CW, CH, DEC_H, CON_H, COL_H, BUSH_H });   // kresby stromů pro prohlížeč (node render.mjs stromy=site/stromy)
+  const tex = new THREE.CanvasTexture(atlas);
+  tex.magFilter = tex.minFilter = THREE.NearestFilter; tex.generateMipmaps = false; tex.colorSpace = THREE.NoColorSpace;
+  // instance billboardů
+  const plane = new THREE.PlaneGeometry(CW * PX, CH * PX);
+  plane.translate(0, CH * PX / 2 - 3 * PX, 0);
+  const n = T.length;
+  const aTile = new Float32Array(n * 2);
+  const bb = new THREE.InstancedMesh(plane, new THREE.ShaderMaterial({
+    uniforms: { uAtlas: { value: tex }, uCell: { value: new THREE.Vector2(CW / atlas.width, CH / atlas.height) }, uShadow: { value: shadowRT.depthTexture }, uLightVP: { value: new THREE.Matrix4() }, uLights: { value: LIGHTS ? 1 : 0 } },
+    vertexShader: /* glsl */`
+      attribute vec2 aTile; varying vec2 vUv; varying vec3 vW;
+      void main(){ vec4 w = modelMatrix * instanceMatrix * vec4(position, 1.0); vW = w.xyz; vUv = aTile + uv * vec2(${(CW / atlas.width).toFixed(6)}, ${(CH / atlas.height).toFixed(6)}); gl_Position = projectionMatrix * viewMatrix * w; }`,
+    fragmentShader: /* glsl */`
+      uniform sampler2D uAtlas, uShadow; uniform mat4 uLightVP; uniform float uLights; varying vec2 vUv; varying vec3 vW;
+      void main(){
+        vec4 c = texture2D(uAtlas, vUv);
+        if (c.a < 0.5) discard;
+        if (uLights > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+        vec4 p = uLightVP * vec4(vW, 1.0); vec3 s = p.xyz / p.w * 0.5 + 0.5;
+        float sh = (s.x > 0.0 && s.x < 1.0 && s.y > 0.0 && s.y < 1.0 && s.z - 0.0012 > texture2D(uShadow, s.xy).r) ? 0.78 : 1.0;
+        vec3 col = c.rgb * sh; if (sh < 1.0) col *= vec3(0.86, 0.9, 1.0);
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+  }), n);
+  allMats.push(bb.material);
+  const m4 = new THREE.Matrix4(), pos = new THREE.Vector3(), sc = new THREE.Vector3();
+  const hsh = (x, y) => { const v = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return v - Math.floor(v); };
+  T.forEach(([x, y, z, h, conif, kind], i) => {
+    const r = hsh(Math.round((x + OFFX) * 100) / 100, Math.round((y + OFFY) * 100) / 100);   // světové souřadnice
+    let list, Hc;
+    if (kind === 1) { list = slots.bush; Hc = BUSH_H; }
+    else if (kind === 3) { const si = h < 8 ? 0 : 1; list = slots.col[si]; Hc = COL_H[si]; }
+    else if (conif) { const si = h < 12 ? 0 : h < 18 ? 1 : 2; list = slots.con[si]; Hc = CON_H[si]; }
+    else { const si = h < 10.5 ? 0 : h < 16 ? 1 : 2; list = slots.dec[si]; Hc = DEC_H[si]; }
+    const sl = list[Math.floor(r * list.length)];
+    const [ox, oy] = cell(sl);
+    aTile[i * 2] = ox / atlas.width; aTile[i * 2 + 1] = 1 - (oy + CH) / atlas.height;
+    const s_ = Math.max(0.75, Math.min(1.3, h / Hc));
+    pos.set(x, z, -y);
+    m4.compose(pos, cam.quaternion, sc.set(s_, s_, 1));
+    bb.setMatrixAt(i, m4);
+  });
+  bb.geometry.setAttribute('aTile', new THREE.InstancedBufferAttribute(aTile, 2));
+  bb.frustumCulled = false; bb.layers.set(1); cam.layers.enable(1);
+  world.add(bb);
+
+  // neviditelná tělesa jen pro stínovou mapu (vrstva 2)
+  const shadowMat = new THREE.MeshBasicMaterial();
+  const crownG = new THREE.IcosahedronGeometry(1, 0), coneG = new THREE.ConeGeometry(1, 1, 6);
+  const crowns = new THREE.InstancedMesh(crownG, shadowMat, n), cones = new THREE.InstancedMesh(coneG, shadowMat, n);
+  let kc = 0, kk = 0; const q = new THREE.Quaternion();
+  for (const [x, y, z, h, conif, kind] of T) {
+    if (conif || kind === 3) { m4.compose(pos.set(x, z + h * 0.5, -y), q, sc.set(h * (kind === 3 ? 0.11 : 0.2), h, h * (kind === 3 ? 0.11 : 0.2))); cones.setMatrixAt(kk++, m4); }
+    else { const r = kind === 1 ? h * 0.5 : h * 0.31, ch = kind === 1 ? h * 0.45 : h * 0.4; m4.compose(pos.set(x, z + h - ch, -y), q, sc.set(r, ch, r)); crowns.setMatrixAt(kc++, m4); }
+  }
+  crowns.count = kc; cones.count = kk;
+  for (const m of [crowns, cones]) { m.frustumCulled = false; m.layers.set(2); world.add(m); }
+  window.TREE_ATLAS = atlas;
+}
+
+// ---------- stínová mapa ----------
+{
+  const lc = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 6000);
+  lc.position.copy(SUN).multiplyScalar(3000);
+  lc.lookAt(0, 0, 0); lc.updateMatrixWorld();
+  lc.layers.enable(2);
+  const inv = lc.matrixWorldInverse;
+  let mnx = 1e9, mxx = -1e9, mny = 1e9, mxy = -1e9, mnz = 1e9, mxz = -1e9;
+  for (const x of [-HE, HE]) for (const z of [-HE, HE]) for (const y of [FLOOR, (scene.top ?? 220) + 5]) {
+    const v = new THREE.Vector3(x, y, z).applyMatrix4(inv);
+    mnx = Math.min(mnx, v.x); mxx = Math.max(mxx, v.x); mny = Math.min(mny, v.y); mxy = Math.max(mxy, v.y);
+    mnz = Math.min(mnz, v.z); mxz = Math.max(mxz, v.z);
+  }
+  // near/far z rozsahu čtverce: pevné 2000–4000 nestačilo, roh za far plane byl celý ve stínu
+  Object.assign(lc, { left: mnx, right: mxx, bottom: mny, top: mxy, near: -mxz - 10, far: -mnz + 10 });
+  lc.updateProjectionMatrix();
+  world.overrideMaterial = new THREE.MeshDepthMaterial();
+  renderer.setRenderTarget(shadowRT); renderer.clear(); renderer.render(world, lc);
+  renderer.setRenderTarget(null); world.overrideMaterial = null;
+  const vp = new THREE.Matrix4().multiplyMatrices(lc.projectionMatrix, lc.matrixWorldInverse);
+  for (const m of allMats) m.uniforms.uLightVP.value.copy(vp);
+}
+
+// ---------- rozsah obrázku ----------
+// obvod terénu (i s pásem sousedů) od spodku řezu po +30 m, k tomu vrcholy budov a stromů
+const inv = cam.matrixWorldInverse;
+let X0 = 1e9, X1 = -1e9, Y0 = 1e9, Y1 = -1e9;
+const ext = (x, h, y) => {
+  const v = new THREE.Vector3(x, h, -y).applyMatrix4(inv);
+  X0 = Math.min(X0, v.x); X1 = Math.max(X1, v.x); Y0 = Math.min(Y0, v.y); Y1 = Math.max(Y1, v.y);
+};
+{
+  const R = MS ? HE : HALF, k0 = MS ? Math.round((scene.margin || 0) / scene.step) : 0;
+  for (let r = MS - k0; r <= MS + N - 1 + k0; r += 2) for (let c = MS - k0; c <= MS + N - 1 + k0; c += 2) {
+    if (r > MS - k0 + 1 && c > MS - k0 + 1 && r < MS + N - 2 + k0 && c < MS + N - 2 + k0) continue;
+    const x = -HALF + (c - MS) * scene.step, y = HALF - (r - MS) * scene.step;
+    const h = MS ? HX[r * NE + c] : HS[r * N + c];
+    ext(Math.max(-R, Math.min(R, x)), h + 30, Math.max(-R, Math.min(R, y))); ext(Math.max(-R, Math.min(R, x)), FLOOR, Math.max(-R, Math.min(R, y)));
+  }
+  for (let r = 0; r < N; r += 8) for (let c = 0; c < N; c += 8) ext(-HALF + c * scene.step, HS[r * N + c] + 5, HALF - r * scene.step);   // vrcholy kopců uvnitř
+  for (const b of scene.buildings) for (const [x, y] of b.p) ext(x, Math.max(b.e + b.rh + 2, b.tm ? b.g + b.tm[6] + 22 : 0), y);
+  for (const t of scene.trees) ext(t[0], t[2] + t[3], t[1]);
+}
+X0 -= 20; Y0 -= 20; X1 += 20; Y1 += 60;     // nahoře rezerva na věže (ručně stavěné dominanty)
+// přichytit k mřížce pixelů společné mapy (gx0/gy1 = počátek celé mapy v souřadnicích kamery)
+const [CXW, CYW] = scene.center || [0, 0];
+const offV = new THREE.Vector3(CXW, 0, -CYW).applyMatrix4(inv).sub(new THREE.Vector3(0, 0, 0).applyMatrix4(inv));
+let GX0 = X0 + offV.x, GY1 = Y1 + offV.y;
+if (PARAMS.gx0) {
+  GX0 = parseFloat(PARAMS.gx0) + Math.floor((GX0 - parseFloat(PARAMS.gx0)) / MPP + 1e-6) * MPP;
+  GY1 = parseFloat(PARAMS.gy1) + Math.ceil((GY1 - parseFloat(PARAMS.gy1)) / MPP - 1e-6) * MPP;
+  X0 = GX0 - offV.x; Y1 = GY1 - offV.y;
+}
+const IW = Math.ceil((X1 - X0) / MPP), IH = Math.ceil((Y1 - Y0) / MPP);
+
+// ---------- post-process: obrysy a světlá hrana nahoře (pixel-art) ----------
+const S = TILE + 2 * PAD;
+const rt = new THREE.WebGLRenderTarget(S, S, { depthTexture: new THREE.DepthTexture(S, S, THREE.FloatType), magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter });
+const post = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+  uniforms: { tC: { value: rt.texture }, tD: { value: rt.depthTexture }, px: { value: new THREE.Vector2(1 / S, 1 / S) }, range: { value: 1 }, lights: { value: LIGHTS ? 1 : 0 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+  fragmentShader: /* glsl */`
+    uniform sampler2D tC, tD; uniform vec2 px; uniform float range, lights; varying vec2 vUv;
+    float D(vec2 o){ return texture2D(tD, vUv + o * px).r * range; }
+    void main(){
+      vec4 c4 = texture2D(tC, vUv); vec3 c = c4.rgb;
+      if (lights > 0.5) { gl_FragColor = vec4(c, c4.a); return; }
+      float d = D(vec2(0.0));
+      float up = D(vec2(0.0, 1.0));
+      float m = max(max(D(vec2(1.0, 0.0)), D(vec2(-1.0, 0.0))), max(up, D(vec2(0.0, -1.0))));
+      if (m - d > 1.6) {
+        c *= 0.5;                                   // tmavý obrys
+        if (up - d > 1.6) c = c / 0.5 * 1.18;       // horní hrana: světlý okraj místo tmavého
+      }
+      gl_FragColor = vec4(c, c4.a);
+    }`,
+}));
+const postScene = new THREE.Scene(); postScene.add(post);
+const postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+window.INFO = { width: IW, height: IH, tile: TILE, cols: Math.ceil(IW / TILE), rows: Math.ceil(IH / TILE), x0: GX0, y1: GY1, mpp: MPP, chunk: scene.chunk || [0, 0], season: SEASON, mode: LIGHTS ? 'lights' : 'day' };
+const out = document.createElement('canvas'); out.width = TILE; out.height = TILE;
+const octx = out.getContext('2d');
+window.renderTile = (i, j) => {
+  const l = X0 + (i * TILE - PAD) * MPP, t = Y1 - (j * TILE - PAD) * MPP;
+  Object.assign(cam, { left: l, right: l + S * MPP, top: t, bottom: t - S * MPP, near: 500, far: 7500 });
+  cam.updateProjectionMatrix();
+  post.material.uniforms.range.value = cam.far - cam.near;
+  renderer.setClearColor(new THREE.Color(...BG), ALPHA ? 0 : 1);
+  renderer.setRenderTarget(rt); renderer.clear(); renderer.render(world, cam);
+  renderer.setRenderTarget(null); renderer.render(postScene, postCam);
+  octx.clearRect(0, 0, TILE, TILE);
+  octx.drawImage(renderer.domElement, PAD, PAD, TILE, TILE, 0, 0, TILE, TILE);
+  return out.toDataURL('image/png');
+};
+window.READY = true;
+</script>
+</body></html>

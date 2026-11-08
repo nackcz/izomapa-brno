@@ -1,0 +1,32 @@
+{
+ "nazev": "Chrastava",
+ "titulek": "Izometrická Chrastava",
+ "h1": [
+  "Izometrická",
+  "Chrastava"
+ ],
+ "podtitul": "Chrastava z otevřených dat, ve stylu SimCity 2000.",
+ "popis": "Izometrická pixel-art mapa: Chrastava ve stylu SimCity 2000. Roční období, den a noc, počasí a příběhy míst.",
+ "url": "",
+ "stred": [14.959788, 50.817584],
+ "polovina": 1150.0,
+ "ctverce": [
+  [0, 2],
+  [1, 2],
+  [0, 1],
+  [1, 1],
+  [0, 0],
+  [1, 0],
+  [-1, -1],
+  [0, -1],
+  [1, -1]
+ ],
+ "href": 340.7,
+ "dno": -100,
+ "mhd": {
+  "gtfs": null,
+  "zdroj": null,
+  "zdroj_url": null
+ },
+ "vanocni_strom": null
+}
